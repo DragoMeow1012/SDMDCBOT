@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"d:/vsc/DCbot_1.0/data/.gitkeep\")"
+    ]
+  }
+}
