@@ -31,12 +31,16 @@ def rotate_api_key() -> None:
 _client = _create_client()
 
 # --- 各人格的對話設定 ---
+_SEARCH_TOOL = types.Tool(google_search=types.GoogleSearch())
+
 _CHAT_CONFIGS: dict[str, types.GenerateContentConfig] = {
     'general': types.GenerateContentConfig(
-        system_instruction=PERSONALITY['general']
+        system_instruction=PERSONALITY['general'],
+        tools=[_SEARCH_TOOL],
     ),
     'master': types.GenerateContentConfig(
-        system_instruction=PERSONALITY['master']
+        system_instruction=PERSONALITY['master'],
+        tools=[_SEARCH_TOOL],
     ),
 }
 

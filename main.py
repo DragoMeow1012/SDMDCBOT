@@ -25,11 +25,10 @@ from web import fetch_url
 from gemini_worker import create_chat, msg_queue, gemini_worker
 from nicknames import (
     load_nicknames, save_nicknames,
-    get_nickname, build_user_context, build_all_nicknames_summary,
+    build_all_nicknames_summary,
 )
 from knowledge import (
-    load_knowledge, add_entry, remove_entry,
-    search_entries, build_knowledge_context,
+    load_knowledge, add_entry, remove_entry, build_knowledge_context,
 )
 from summary import load_summary
 
@@ -61,6 +60,54 @@ async def slash_nick(interaction: discord.Interaction, 暱稱: str):
     nicknames[str(interaction.user.id)] = 暱稱
     save_nicknames(nicknames)
     await interaction.response.send_message(f'好的，我會記住你叫「{暱稱}」！', ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# /kb 指令群組（新增 / 載入知識庫）
+# ---------------------------------------------------------------------------
+kb_group = app_commands.Group(name="kb", description="知識庫管理")
+tree.add_command(kb_group)
+
+
+@kb_group.command(name="add", description="新增內容到知識庫（文字或上傳檔案）")
+@app_commands.describe(文字="要儲存的文字內容", 檔案="要儲存的文字檔案（.txt/.md 等）")
+async def slash_kb_add(interaction: discord.Interaction,
+                       文字: str = None,
+                       檔案: discord.Attachment = None):
+    global knowledge_entries
+    parts = []
+    if 文字:
+        parts.append(文字.strip())
+    if 檔案:
+        try:
+            raw = await 檔案.read()
+            parts.append(f'[{檔案.filename}]\n{raw.decode("utf-8", errors="replace")[:5000]}')
+        except Exception as e:
+            await interaction.response.send_message(f'讀取檔案失敗: {e}', ephemeral=True)
+            return
+    if not parts:
+        await interaction.response.send_message('請提供文字內容或上傳檔案喵！', ephemeral=True)
+        return
+    entry = add_entry(knowledge_entries, '\n'.join(parts), interaction.user.id)
+    await interaction.response.send_message(f'已儲存至知識庫 `#{entry["id"]}`！', ephemeral=True)
+
+
+@kb_group.command(name="load", description="將知識庫內容注入此頻道對話供模型參考")
+async def slash_kb_load(interaction: discord.Interaction):
+    cid = interaction.channel_id
+    sess = chat_sessions.get(cid)
+    if not sess or not sess.get('chat_obj'):
+        await interaction.response.send_message('此頻道尚未開始對話喵！請先 @我 說話。', ephemeral=True)
+        return
+    kb_ctx = build_knowledge_context(knowledge_entries)
+    if not kb_ctx.strip():
+        await interaction.response.send_message('知識庫目前是空的喵！', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    chat = sess['chat_obj']
+    await asyncio.to_thread(chat.send_message, kb_ctx)
+    save_history(chat_sessions)
+    await interaction.followup.send('✅ 知識庫已注入此頻道對話！', ephemeral=True)
 
 
 async def _apply_gag(target: discord.Member, duration: int) -> str | None:
@@ -101,7 +148,7 @@ class GagConfirmView(discord.ui.View):
         self.stop()
 
 
-@tree.command(name="電子口球", description="禁止某成員在此頻道傳送訊息一段時間")
+@tree.command(name="電子口球", description="對成員套用全伺服器禁言（Timeout）")
 @app_commands.describe(time="持續秒數", who="目標（預設為自己）")
 async def slash_gag(interaction: discord.Interaction,
                     time: int,
@@ -144,76 +191,48 @@ def _init_session(cid: int, personality: str, sess: dict | None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# !nick 指令處理（不經過 Gemini，直接操作暱稱檔案）
-# 語法：
-#   @Bot !nick 設定 <@user 或 user_id> <暱稱>   → 設定暱稱（主人：任意；訪客：僅限自己）
-#   @Bot !nick 刪除 <@user 或 user_id>          → 刪除暱稱（主人限定）
-#   @Bot !nick 列表                             → 列出所有暱稱（主人限定）
-#   @Bot !nick 我的暱稱 <暱稱>                   → 設定自己的暱稱（任何人）
+# !nick 文字指令（主人管理用）
+#   !nick 列表                          → 列出所有暱稱
+#   !nick 設定 <@user|user_id> <暱稱>   → 設定暱稱（主人：任意；訪客：僅限自己）
+#   !nick 刪除 <@user|user_id>          → 刪除暱稱（主人限定）
 # ---------------------------------------------------------------------------
-async def handle_nick_command(msg: discord.Message, args: str) -> bool:
-    """
-    處理 !nick 指令。
-    回傳 True 表示已處理（不需再送 Gemini）；False 表示不是 nick 指令。
-    """
+async def handle_nick_command(msg: discord.Message, args: str) -> None:
     global nicknames
 
     args = args.strip()
     is_master = (msg.author.id == MASTER_ID)
 
-    # !nick 列表（主人限定）
     if args in ('列表', 'list') and is_master:
         if not nicknames:
             await msg.reply('目前沒有任何已登記的暱稱。')
         else:
             lines = '\n'.join(f'`{uid}` → {nick}' for uid, nick in nicknames.items())
             await msg.reply(f'**已登記暱稱清單：**\n{lines}')
-        return True
+        return
 
-    # !nick 我的暱稱 <暱稱>（任何人，設定自己）
-    if args.startswith('我的暱稱 ') or args.startswith('我的暱稱　'):
-        new_nick = args[5:].strip()
-        if not new_nick:
-            await msg.reply('請提供要設定的暱稱。')
-            return True
-        nicknames[str(msg.author.id)] = new_nick
-        save_nicknames(nicknames)
-        await msg.reply(f'好的，我會記住你叫「{new_nick}」！')
-        return True
-
-    # !nick 設定 <target> <暱稱>
     if args.startswith('設定 ') or args.startswith('設定　'):
         parts = args[3:].strip().split(None, 1)
         if len(parts) < 2:
             await msg.reply('語法：`!nick 設定 <@user 或 user_id> <暱稱>`')
-            return True
-
+            return
         target_raw, new_nick = parts[0], parts[1].strip()
         target_id = _parse_user_id(target_raw, msg)
-
         if target_id is None:
             await msg.reply('無法辨識目標用戶，請使用 @提及 或直接輸入 user_id。')
-            return True
-
-        # 權限檢查：訪客只能設定自己
+            return
         if not is_master and target_id != msg.author.id:
             await msg.reply('你只能設定自己的暱稱喔。')
-            return True
-
+            return
         nicknames[str(target_id)] = new_nick
         save_nicknames(nicknames)
         await msg.reply(f'已將 `{target_id}` 的暱稱設為「{new_nick}」。')
-        return True
+        return
 
-    # !nick 刪除 <target>（主人限定）
     if (args.startswith('刪除 ') or args.startswith('刪除　')) and is_master:
-        target_raw = args[3:].strip()
-        target_id = _parse_user_id(target_raw, msg)
-
+        target_id = _parse_user_id(args[3:].strip(), msg)
         if target_id is None:
             await msg.reply('無法辨識目標用戶。')
-            return True
-
+            return
         uid_str = str(target_id)
         if uid_str in nicknames:
             removed = nicknames.pop(uid_str)
@@ -221,87 +240,49 @@ async def handle_nick_command(msg: discord.Message, args: str) -> bool:
             await msg.reply(f'已刪除 `{target_id}` 的暱稱（原為「{removed}」）。')
         else:
             await msg.reply(f'`{target_id}` 沒有登記暱稱。')
-        return True
+        return
 
-    return False  # 不是 nick 指令
+    await msg.reply('語法：`!nick 列表` / `!nick 設定 <user> <暱稱>` / `!nick 刪除 <user>`')
 
 
 # ---------------------------------------------------------------------------
-# !kb 指令處理（不經過 Gemini，直接操作知識庫檔案）
-# 語法：
-#   @Bot !kb 儲存 <內容>       → 儲存一條知識（任何人）
-#   @Bot !kb 列表             → 列出全部條目（主人限定）
-#   @Bot !kb 刪除 <id>        → 刪除指定條目（主人限定）
-#   @Bot !kb 查詢 <關鍵字>     → 搜尋相關條目（任何人）
+# !kb 文字指令（主人管理用；新增/載入請用 /kb add 和 /kb load）
+#   !kb 列表         → 列出所有條目（主人限定）
+#   !kb 刪除 <id>    → 刪除條目（主人限定）
 # ---------------------------------------------------------------------------
-async def handle_kb_command(msg: discord.Message, args: str) -> bool:
-    """
-    處理 !kb 指令。
-    回傳 True 表示已處理；False 表示不是 kb 指令。
-    """
+async def handle_kb_command(msg: discord.Message, args: str) -> None:
     global knowledge_entries
 
     args = args.strip()
     is_master = (msg.author.id == MASTER_ID)
 
-    # !kb 列表（主人限定）
-    if args in ('列表', 'list') and is_master:
+    if not is_master:
+        await msg.reply('知識庫管理指令限主人使用，新增請用 `/kb add` 喵！')
+        return
+
+    if args in ('列表', 'list'):
         if not knowledge_entries:
             await msg.reply('知識庫目前是空的。')
         else:
             lines = '\n'.join(
-                f'`#{e["id"]}` [{e["timestamp"]}] {e["content"]}'
+                f'`#{e["id"]}` [{e["timestamp"]}] {e["content"][:80]}'
                 for e in knowledge_entries
             )
             await msg.reply(f'**知識庫條目（共 {len(knowledge_entries)} 筆）：**\n{lines}')
-        return True
+        return
 
-    # !kb 儲存 <內容>（任何人）
-    if args.startswith('儲存 ') or args.startswith('儲存　') or args.startswith('save '):
-        content = args.split(None, 1)[1].strip() if ' ' in args or '\u3000' in args else ''
-        if not content:
-            await msg.reply('請提供要儲存的內容。語法：`!kb 儲存 <內容>`')
-            return True
-        entry = add_entry(knowledge_entries, content, msg.author.id)
-        await msg.reply(f'已儲存至知識庫 `#{entry["id"]}`！')
-        print(f'[KB] 新增 #{entry["id"]}: {content[:60]}')
-        return True
-
-    # !kb 刪除 <id>（主人限定）
-    if (args.startswith('刪除 ') or args.startswith('刪除　') or args.startswith('del ')) and is_master:
+    if args.startswith('刪除 ') or args.startswith('刪除　'):
         id_str = args.split(None, 1)[1].strip()
         if not id_str.isdigit():
             await msg.reply('請提供有效的條目 ID（數字）。')
-            return True
+            return
         if remove_entry(knowledge_entries, int(id_str)):
             await msg.reply(f'已刪除知識庫條目 `#{id_str}`。')
         else:
             await msg.reply(f'找不到條目 `#{id_str}`。')
-        return True
+        return
 
-    # !kb 查詢 <關鍵字>（任何人）
-    if args.startswith('查詢 ') or args.startswith('查詢　') or args.startswith('search '):
-        keyword = args.split(None, 1)[1].strip()
-        results = search_entries(knowledge_entries, keyword)
-        if not results:
-            await msg.reply(f'知識庫中沒有關於「{keyword}」的條目。')
-        else:
-            lines = '\n'.join(
-                f'`#{e["id"]}` [{e["timestamp"]}] {e["content"]}'
-                for e in results
-            )
-            await msg.reply(f'找到 {len(results)} 筆相關條目：\n{lines}')
-        return True
-
-    # 不認識的子指令
-    await msg.reply(
-        '**!kb 指令說明：**\n'
-        '`!kb 儲存 <內容>` — 儲存知識\n'
-        '`!kb 查詢 <關鍵字>` — 搜尋知識\n'
-        '`!kb 列表` — 列出全部（主人限定）\n'
-        '`!kb 刪除 <id>` — 刪除條目（主人限定）'
-    )
-    return True
+    await msg.reply('語法：`!kb 列表` / `!kb 刪除 <id>`')
 
 
 # ---------------------------------------------------------------------------
@@ -389,17 +370,6 @@ async def on_message(msg: discord.Message) -> None:
         await msg.reply('主...主人...請問...需...需要什麼協助嗎？喵嗚...')
         return
 
-    # --- /nick <暱稱> 快捷指令（任何人，設定自己的暱稱）---
-    if raw_text.startswith('/nick ') or raw_text.startswith('/nick　'):
-        new_nick = raw_text[6:].strip()
-        if new_nick:
-            nicknames[str(msg.author.id)] = new_nick
-            save_nicknames(nicknames)
-            await msg.reply(f'好的，我會記住你叫「{new_nick}」！')
-        else:
-            await msg.reply('請提供暱稱。語法：`/nick <暱稱>`')
-        return
-
     # --- !nick 指令攔截（不送 Gemini）---
     if raw_text.startswith('!nick ') or raw_text.startswith('!nick　'):
         await handle_nick_command(msg, raw_text[6:])
@@ -413,8 +383,15 @@ async def on_message(msg: discord.Message) -> None:
     print(f'[MSG] ch={cid} [{personality}]: {raw_text[:80]}')
 
     # --- 建立用戶身分前綴注入給模型 ---
-    user_ctx = build_user_context(msg.author.id, nicknames)
-    # 主人模式額外附上全部暱稱清單，方便模型稱呼其他用戶
+    uid_str = str(msg.author.id)
+    nick = nicknames.get(uid_str)
+    display_name = msg.author.display_name
+
+    if nick:
+        user_ctx = f'[User ID: {msg.author.id}, 暱稱: {nick}]'
+    else:
+        user_ctx = f'[User ID: {msg.author.id}, 伺服器名稱: {display_name}（未設定自訂暱稱，請以此名稱稱呼對方）]'
+
     if is_master:
         nick_summary = build_all_nicknames_summary(nicknames)
         identity_prefix = f'{nick_summary}\n{user_ctx}\n'
@@ -481,9 +458,7 @@ async def on_message(msg: discord.Message) -> None:
     elif web_ctx := chat_sessions[cid].get('current_web_context'):
         prompt = f'根據我之前讀取的內容：\n```\n{web_ctx}\n```\n請問：{prompt}'
 
-    # 將知識庫 + 身分前綴合併進 prompt
-    kb_ctx = build_knowledge_context(knowledge_entries)
-    final_prompt = kb_ctx + identity_prefix + prompt
+    final_prompt = identity_prefix + prompt
 
     await msg_queue.put({
         'channel_id': cid,
