@@ -8,7 +8,7 @@ from google.genai import types
 
 from config import GEMINI_API_KEYS, GEMINI_MODEL_NAME, PERSONALITY, API_DELAY
 from history import save_history
-from knowledge import add_entry
+from knowledge import add_entry, consolidate_knowledge
 
 # --- API Key 輪替 ---
 _key_index: int = 0
@@ -92,12 +92,34 @@ def create_chat(personality: str, history: list, summary: str | None = None) -> 
     )
 
 
+async def analyze_for_kb(raw_content: str) -> str:
+    """
+    使用 Gemini 分析並統整原始內容，回傳適合存入知識庫的摘要文字。
+    獨立呼叫（非 chat），不影響任何頻道對話歷史。
+    """
+    prompt = (
+        "請分析以下內容，提取關鍵資訊並整理為簡潔的繁體中文摘要，"
+        "方便日後查詢。保留重要數值、名稱、日期等細節，省略冗餘敘述：\n\n"
+        f"{raw_content[:8000]}"
+    )
+    try:
+        resp = await asyncio.to_thread(
+            _client.models.generate_content,
+            model=GEMINI_MODEL_NAME,
+            contents=prompt,
+        )
+        return resp.text.strip()
+    except Exception as e:
+        print(f"[KB] analyze_for_kb 失敗: {e}")
+        return raw_content[:2000]  # 分析失敗時 fallback 存原始內容
+
+
 # --- 請求佇列 ---
 msg_queue: asyncio.Queue = asyncio.Queue()
 _last_api_time: float = 0.0
 
 
-async def gemini_worker(chat_sessions: dict) -> None:
+async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = None) -> None:
     """
     持續從 msg_queue 取出請求並呼叫 Gemini API。
     確保 task_done() 在所有路徑皆被呼叫。
@@ -175,6 +197,9 @@ async def gemini_worker(chat_sessions: dict) -> None:
                             if attempt < max_attempts - 1:
                                 print(f"[WARN] quota 觸發 ch={cid} attempt={attempt + 1}/{max_attempts}，輪替 Key...")
                                 rotate_api_key()
+                                # API 輪替後統整知識庫
+                                if knowledge_entries is not None:
+                                    consolidate_knowledge(knowledge_entries)
                                 # 重建 chat 以綁定新 Client，並還原當前歷史
                                 hist = [
                                     {"role": m.role, "parts": [{"text": p.text if p.text else "[附件]"} for p in m.parts]}

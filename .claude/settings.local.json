@@ -44,7 +44,10 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(python main.py)",
       "Bash(find . -name .env* -type f)",
-      "Bash(wc -l /d/vsc/DCbot_1.0/*.py)"
+      "Bash(wc -l /d/vsc/DCbot_1.0/*.py)",
+      "Bash(taskkill /F /IM python.exe)",
+      "Bash(cmd /c \"taskkill /F /IM python.exe\")",
+      "Bash(cmd /c \"taskkill /F /IM python.exe && echo killed\")"
     ]
   }
 }

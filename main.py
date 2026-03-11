@@ -22,13 +22,15 @@ if hasattr(sys.stderr, 'reconfigure'):
 from config import DISCORD_TOKEN, MASTER_ID
 from history import load_history, save_history
 from web import fetch_url
-from gemini_worker import create_chat, msg_queue, gemini_worker
+from gemini_worker import create_chat, msg_queue, gemini_worker, analyze_for_kb
 from nicknames import (
     load_nicknames, save_nicknames,
     build_all_nicknames_summary,
 )
 from knowledge import (
-    load_knowledge, add_entry, remove_entry, search_entries, build_knowledge_context,
+    load_knowledge, add_entry, remove_entry, search_entries,
+    build_knowledge_context, consolidate_knowledge,
+    list_sections, remove_section,
 )
 from reverse_search import reverse_image_search
 from summary import load_summary
@@ -81,27 +83,74 @@ kb_group = app_commands.Group(name="kb", description="知識庫管理")
 tree.add_command(kb_group)
 
 
-@kb_group.command(name="add", description="新增內容到知識庫（文字或上傳檔案）")
-@app_commands.describe(文字="要儲存的文字內容", 檔案="要儲存的文字檔案（.txt/.md 等）")
+@kb_group.command(name="add", description="新增內容到知識庫（文字或上傳檔案，檔案會由 AI 分析統整）")
+@app_commands.describe(文字="要儲存的文字內容", 檔案="要儲存並分析的檔案（.txt/.csv/.json/.sql 等）")
 async def slash_kb_add(interaction: discord.Interaction,
                        文字: str = None,
                        檔案: discord.Attachment = None):
     global knowledge_entries
+    if not 文字 and not 檔案:
+        await interaction.response.send_message('請提供文字內容或上傳檔案喵！', ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
     parts = []
     if 文字:
         parts.append(文字.strip())
+
     if 檔案:
         try:
             raw = await 檔案.read()
-            parts.append(f'[{檔案.filename}]\n{raw.decode("utf-8", errors="replace")[:5000]}')
+            file_text = raw.decode('utf-8', errors='replace')
+            await interaction.followup.send(f'正在分析 `{檔案.filename}`，請稍候...', ephemeral=True)
+            summary = await analyze_for_kb(f'[{檔案.filename}]\n{file_text}')
+            parts.append(f'[{檔案.filename} 分析結果]\n{summary}')
         except Exception as e:
-            await interaction.response.send_message(f'讀取檔案失敗: {e}', ephemeral=True)
+            await interaction.followup.send(f'讀取或分析檔案失敗: {e}', ephemeral=True)
             return
-    if not parts:
-        await interaction.response.send_message('請提供文字內容或上傳檔案喵！', ephemeral=True)
-        return
+
     entry = add_entry(knowledge_entries, '\n'.join(parts), interaction.user.id)
-    await interaction.response.send_message(f'已儲存至知識庫 `#{entry["id"]}`！', ephemeral=True)
+    await interaction.followup.send(f'✅ 已分析並儲存至知識庫 `#{entry["id"]}`！', ephemeral=True)
+
+
+@kb_group.command(name="remove", description="刪除知識庫中指定節次的資料（主人限定）")
+@app_commands.describe(節次="要刪除的節次編號（先用 /kb list 查看）")
+async def slash_kb_remove(interaction: discord.Interaction, 節次: int):
+    if interaction.user.id != MASTER_ID:
+        await interaction.response.send_message('此指令限主人使用喵！', ephemeral=True)
+        return
+    sections = list_sections(knowledge_entries)
+    if not sections:
+        await interaction.response.send_message('知識庫目前是空的喵！', ephemeral=True)
+        return
+    if remove_section(knowledge_entries, 節次):
+        remaining = len(list_sections(knowledge_entries))
+        await interaction.response.send_message(
+            f'✅ 已刪除第 `{節次}` 節，剩餘 {remaining} 節。', ephemeral=True
+        )
+    else:
+        lines = '\n'.join(f'`[{i+1}]` {s[:80]}…' for i, s in enumerate(sections))
+        await interaction.response.send_message(
+            f'找不到第 `{節次}` 節喵！目前有 {len(sections)} 節：\n{lines}', ephemeral=True
+        )
+
+
+@kb_group.command(name="list", description="列出知識庫各節內容（主人限定）")
+async def slash_kb_list(interaction: discord.Interaction):
+    if interaction.user.id != MASTER_ID:
+        await interaction.response.send_message('此指令限主人使用喵！', ephemeral=True)
+        return
+    sections = list_sections(knowledge_entries)
+    if not sections:
+        await interaction.response.send_message('知識庫目前是空的喵！', ephemeral=True)
+        return
+    lines = '\n\n'.join(
+        f'**[{i+1}]** {s[:150]}{"…" if len(s) > 150 else ""}' for i, s in enumerate(sections)
+    )
+    await interaction.response.send_message(
+        f'**知識庫各節（共 {len(sections)} 節）：**\n{lines}', ephemeral=True
+    )
 
 
 @kb_group.command(name="load", description="從磁碟重新載入知識庫並注入此頻道對話供模型參考")
@@ -210,8 +259,8 @@ def _init_session(cid: int, personality: str, sess: dict | None) -> None:
 
 # ---------------------------------------------------------------------------
 # !kb 文字指令（主人管理用；新增/載入請用 /kb add 和 /kb load）
-#   !kb 列表         → 列出所有條目（主人限定）
-#   !kb 刪除 <id>    → 刪除條目（主人限定）
+#   !kb 列表         → 列出統整條目各節（主人限定）
+#   !kb 清除 <n>     → 刪除第 n 節（主人限定）
 # ---------------------------------------------------------------------------
 async def handle_kb_command(msg: discord.Message, args: str) -> None:
     global knowledge_entries
@@ -224,28 +273,30 @@ async def handle_kb_command(msg: discord.Message, args: str) -> None:
         return
 
     if args in ('列表', 'list'):
-        if not knowledge_entries:
+        sections = list_sections(knowledge_entries)
+        if not sections:
             await msg.reply('知識庫目前是空的。')
         else:
-            lines = '\n'.join(
-                f'`#{e["id"]}` [{e["timestamp"]}] {e["content"][:80]}'
-                for e in knowledge_entries
+            lines = '\n\n'.join(
+                f'**[{i + 1}]** {s[:120]}{"…" if len(s) > 120 else ""}'
+                for i, s in enumerate(sections)
             )
-            await msg.reply(f'**知識庫條目（共 {len(knowledge_entries)} 筆）：**\n{lines}')
+            await msg.reply(f'**知識庫各節（共 {len(sections)} 節）：**\n{lines}\n\n用 `!kb 清除 <節次>` 刪除指定節。')
         return
 
-    if args.startswith('刪除 ') or args.startswith('刪除　'):
-        id_str = args.split(None, 1)[1].strip()
-        if not id_str.isdigit():
-            await msg.reply('請提供有效的條目 ID（數字）。')
+    if args.startswith('清除 ') or args.startswith('清除　'):
+        n_str = args.split(None, 1)[1].strip()
+        if not n_str.isdigit():
+            await msg.reply('請提供有效的節次編號（數字）。')
             return
-        if remove_entry(knowledge_entries, int(id_str)):
-            await msg.reply(f'已刪除知識庫條目 `#{id_str}`。')
+        if remove_section(knowledge_entries, int(n_str)):
+            remaining = len(list_sections(knowledge_entries))
+            await msg.reply(f'已刪除第 `{n_str}` 節，剩餘 {remaining} 節。')
         else:
-            await msg.reply(f'找不到條目 `#{id_str}`。')
+            await msg.reply(f'找不到第 `{n_str}` 節，請先用 `!kb 列表` 確認節次。')
         return
 
-    await msg.reply('語法：`!kb 列表` / `!kb 刪除 <id>`')
+    await msg.reply('語法：`!kb 列表` / `!kb 清除 <節次>`')
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +304,7 @@ async def handle_kb_command(msg: discord.Message, args: str) -> None:
 # ---------------------------------------------------------------------------
 _SOURCE_KEYWORDS: frozenset[str] = frozenset({
     '來源', '圖源', '出處', '哪裡', '從哪', '誰畫', '作者', '作品', '找圖', 'source', 'where', 'origin',
+    '找本子', '找本本', '番號', '號碼',
 })
 
 
@@ -311,10 +363,11 @@ async def on_ready() -> None:
 
     nicknames = load_nicknames()
     knowledge_entries = load_knowledge()
+    consolidate_knowledge(knowledge_entries)  # 重啟時統整，只保留單一條目
 
     if not _worker_started:
         _worker_started = True
-        asyncio.create_task(gemini_worker(chat_sessions))
+        asyncio.create_task(gemini_worker(chat_sessions, knowledge_entries))
 
     await tree.sync()
     print(f'[OK] Bot ready! {len(chat_sessions)} channels, {len(nicknames)} nicknames, {len(knowledge_entries)} KB entries.')
@@ -383,7 +436,7 @@ async def on_message(msg: discord.Message) -> None:
                     continue
                 try:
                     data = await attachment.read()
-                    file_parts.append({'data': data, 'mime_type': mime})
+                    file_parts.append({'data': data, 'mime_type': mime, 'url': attachment.url})
                     print(f'[FILE] {attachment.filename} ({mime}, {len(data)} bytes)')
                 except Exception as e:
                     await msg.reply(f'讀取 `{attachment.filename}` 失敗: {e}')
@@ -407,10 +460,13 @@ async def on_message(msg: discord.Message) -> None:
     if file_parts and _is_source_query(prompt):
         await msg.channel.send('喵嗚~ 正在以圖搜圖，尋找來源中...')
         search_results = await reverse_image_search(
-            file_parts[-1]['data'], file_parts[-1]['mime_type']
+            file_parts[-1]['data'], file_parts[-1]['mime_type'],
         )
-        await msg.channel.send(f'**以圖搜圖結果：**\n{search_results}')
-        prompt = f'[以圖搜圖結果]\n{search_results}\n\n用戶問題：{prompt}'
+        prompt = (
+            f'[以圖搜圖結果]\n{search_results}\n\n'
+            f'用戶問題：{prompt}\n\n'
+            f'[指示] 根據以上搜圖結果，只需回答作者名稱與來源連結，不要延伸或補充其他資訊。連結格式必須使用 **網址** 加粗顯示（例如：**https://nhentai.net/g/123/**），不要使用 [文字](連結) 的超連結格式。'
+        )
 
     # --- URL 偵測 ---
     if url_match := re.search(r'https?://[^\s\)\]\>\"\'`]+(?<![.,;:!?])', prompt):
