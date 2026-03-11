@@ -304,7 +304,7 @@ async def handle_kb_command(msg: discord.Message, args: str) -> None:
 # ---------------------------------------------------------------------------
 _SOURCE_KEYWORDS: frozenset[str] = frozenset({
     '來源', '圖源', '出處', '哪裡', '從哪', '誰畫', '作者', '作品', '找圖', 'source', 'where', 'origin',
-    '找本子', '找本本', '番號', '號碼',
+    '找本子', '找本本', '番號', '號碼', '查本子',
 })
 
 
@@ -460,12 +460,24 @@ async def on_message(msg: discord.Message) -> None:
     if file_parts and _is_source_query(prompt):
         await msg.channel.send('喵嗚~ 正在以圖搜圖，尋找來源中...')
         search_results = await reverse_image_search(
-            file_parts[-1]['data'], file_parts[-1]['mime_type'],
+            file_parts[-1]['data'],
+            file_parts[-1]['mime_type'],
         )
         prompt = (
             f'[以圖搜圖結果]\n{search_results}\n\n'
             f'用戶問題：{prompt}\n\n'
-            f'[指示] 根據以上搜圖結果，只需回答作者名稱、作品名稱和來源連結，不要延伸或補充其他資訊。連結格式必須使用 **網址** 加粗顯示（例如：**https://nhentai.net/g/123/**），不要使用 [文字](連結) 的超連結格式。'
+            f'[指示]\n'
+            f'請先仔細觀察附件圖片，判斷它是「插畫（單張插圖/同人圖/CG）」還是「連篇漫畫（多頁本子/doujinshi）」。\n\n'
+            f'依據判斷結果，從上方搜尋結果中篩選並輸出對應的連結：\n'
+            f'- 若為「插畫」：只輸出 pixiv、twitter、x.com 來源的連結\n'
+            f'  - 若搜尋結果中找不到這些來源的連結，可愛的回覆找不到圖片\n'
+            f'- 若為「連篇漫畫」：只輸出 nhentai 來源的連結\n'
+            f'  - 若搜尋結果中找不到 nhentai 連結，回覆找到的其他最相關連結\n\n'
+            f'輸出格式：\n'
+            f'- 每筆結果獨立一行，格式：來源名稱｜作品名稱（若有）｜作者名稱（若有）\n'
+            f'  連結：**網址**\n'
+            f'- 連結格式必須使用 **網址** 加粗顯示，不要使用 [文字](連結) 超連結格式\n'
+            f'- 不得添加任何額外說明或延伸內容'
         )
 
     # --- URL 偵測 ---
@@ -479,7 +491,7 @@ async def on_message(msg: discord.Message) -> None:
         content = await fetch_url(url)
 
         if content.startswith('錯誤:') or not content:
-            await msg.reply(f'喵嗚... 抓取網頁失敗: {content}')
+            await msg.reply('喵嗚... 抓取網頁失敗了')
         else:
             chat_sessions[cid]['current_web_context'] = content
             await msg.reply('喵嗚！已成功抓取網頁內容囉！')

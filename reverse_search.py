@@ -1,7 +1,7 @@
 """
-以圖搜圖模組：SauceNAO + soutubot 依序搜尋。
+以圖搜圖模組：soutubot → SauceNAO。
+- soutubot.moe：特徵點比對（Playwright 模擬）
 - SauceNAO：動漫/漫畫/成人來源（含 nhentai index 18）
-- soutubot.moe：特徵點比對搜尋（透過 web session）
 """
 import asyncio
 import requests
@@ -73,6 +73,7 @@ async def _saucenao_search(image_data: bytes, mime_type: str) -> list[str]:
         params['api_key'] = SAUCENAO_API_KEY
 
     try:
+        await asyncio.sleep(0.5)
         resp = await asyncio.to_thread(
             requests.post,
             _SAUCENAO_URL,
@@ -97,8 +98,6 @@ async def _saucenao_search(image_data: bytes, mime_type: str) -> list[str]:
     except Exception as e:
         print(f'[SAUCE] 搜尋失敗: {e}')
         return []
-
-
 
 
 _SOUTUBOT_BASE = 'https://soutubot.moe'
@@ -217,16 +216,16 @@ async def reverse_image_search(
     mime_type: str,
 ) -> str:
     """
-    依序執行 SauceNAO → IQDB → soutubot 搜尋（各請求間隔 500ms）。
+    依序執行 soutubot → SauceNAO 搜尋。
     """
-    sauce_lines = await _saucenao_search(image_data, mime_type)
-    await asyncio.sleep(0.5)
     soutu_lines = await _soutubot_search(image_data, mime_type)
+    await asyncio.sleep(0.5)
+    sauce_lines = await _saucenao_search(image_data, mime_type)
 
     # 合併去重（避免同一連結出現兩次）
     seen_urls: set[str] = set()
     combined: list[str] = []
-    for line in sauce_lines + soutu_lines:
+    for line in soutu_lines + sauce_lines:
         url_in_line = next(
             (w for w in line.split() if w.startswith('http')), ''
         )

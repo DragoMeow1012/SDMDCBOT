@@ -15,6 +15,9 @@ async def fetch_url(url: str) -> str:
     成功回傳清理後的文字（最多 2000 字）；
     失敗回傳以「錯誤:」開頭的說明字串。
     """
+    if 'nhentai.net' in url:
+        return '錯誤: 不支援抓取此網站'
+
     try:
         resp = await asyncio.to_thread(
             requests.get, url, timeout=(5, 15),

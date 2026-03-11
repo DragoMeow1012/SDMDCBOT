@@ -165,7 +165,10 @@ async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = No
                             content = prompt
                         resp = await asyncio.to_thread(chat.send_message, content)
                         _last_api_time = asyncio.get_running_loop().time()
-                        text: str = resp.text
+                        text: str = resp.text or ''
+                        if not text:
+                            await msg.reply('喵嗚... 這個問題我沒辦法回答')
+                            break
 
                         if len(text) > 2000:
                             await msg.reply("我的回應太長了，我會分段傳送：")
