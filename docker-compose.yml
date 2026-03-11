@@ -1,0 +1,8 @@
+services:
+  dcbot:
+    build: .
+    container_name: dcbot
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
