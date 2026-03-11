@@ -5,7 +5,7 @@
 """
 import os
 import json
-from config import DATA_DIR, HISTORY_FILE
+from config import DATA_DIR, HISTORY_FILE, HISTORY_MAX_TURNS
 from summary import save_summary
 
 
@@ -78,6 +78,10 @@ def save_history(chat_sessions: dict) -> None:
                 ]
             else:
                 hist = sess.get('raw_history', [])
+
+            # 超出上限時保留最新的 HISTORY_MAX_TURNS 筆
+            if len(hist) > HISTORY_MAX_TURNS:
+                hist = hist[-HISTORY_MAX_TURNS:]
 
             data[str(cid)] = {
                 'raw_history': hist,

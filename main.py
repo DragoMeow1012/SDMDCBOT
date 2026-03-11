@@ -30,6 +30,7 @@ from nicknames import (
 from knowledge import (
     load_knowledge, add_entry, remove_entry, build_knowledge_context,
 )
+from reverse_search import reverse_image_search
 from summary import load_summary
 
 # --- Discord Client ---
@@ -288,6 +289,15 @@ async def handle_kb_command(msg: discord.Message, args: str) -> None:
 # ---------------------------------------------------------------------------
 # 附件處理輔助
 # ---------------------------------------------------------------------------
+_SOURCE_KEYWORDS: frozenset[str] = frozenset({
+    '來源', '圖源', '出處', '哪裡', '從哪', '誰畫', '作者', '作品', 'source', 'where', 'origin',
+})
+
+
+def _is_source_query(text: str) -> bool:
+    return any(kw in text.lower() for kw in _SOURCE_KEYWORDS)
+
+
 _INLINE_MIME_TYPES: frozenset[str] = frozenset({
     'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'application/pdf',
 })
@@ -432,6 +442,14 @@ async def on_message(msg: discord.Message) -> None:
                     f'喵嗚... 不支援 `{attachment.filename}` 的格式（{mime}），'
                     '目前支援：圖片（jpg/png/gif/webp）、PDF、文字檔。'
                 )
+
+    # --- 以圖搜圖（詢問圖片來源時）---
+    if file_parts and _is_source_query(prompt):
+        await msg.channel.send('喵嗚~ 正在以圖搜圖，尋找來源中...')
+        search_results = await reverse_image_search(
+            file_parts[-1]['data'], file_parts[-1]['mime_type']
+        )
+        prompt = f'[以圖搜圖結果]\n{search_results}\n\n用戶問題：{prompt}'
 
     # --- URL 偵測 ---
     if url_match := re.search(r'https?://\S+', prompt):

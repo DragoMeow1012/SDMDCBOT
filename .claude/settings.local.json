@@ -36,7 +36,8 @@
       "Bash(cmd.exe /c \"python --version 2>&1\")",
       "Bash(powershell.exe -Command \"[Environment]::SetEnvironmentVariable\\(''Path'', [Environment]::GetEnvironmentVariable\\(''Path'',''User''\\) + '';C:\\\\Users\\\\DragonMeow\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312;C:\\\\Users\\\\DragonMeow\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\Scripts'', ''User''\\); Write-Output ''Done''\")",
       "Bash(powershell.exe -Command \"[Environment]::GetEnvironmentVariable\\(''''Path'''',''''User''''\\)\")",
-      "Bash(\"/c/Users/DragonMeow/AppData/Local/Programs/Python/Python312/python.exe\" -c \"from google.genai import chats; import inspect; print\\([a for a in dir\\(chats.Chat\\) if not a.startswith\\(''__''\\)]\\)\")"
+      "Bash(\"/c/Users/DragonMeow/AppData/Local/Programs/Python/Python312/python.exe\" -c \"from google.genai import chats; import inspect; print\\([a for a in dir\\(chats.Chat\\) if not a.startswith\\(''__''\\)]\\)\")",
+      "WebSearch"
     ]
   }
 }
