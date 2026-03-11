@@ -55,12 +55,23 @@ _worker_started: bool = False
 # ---------------------------------------------------------------------------
 # 全域斜線指令
 # ---------------------------------------------------------------------------
-@tree.command(name="nick", description="設定你的暱稱")
-@app_commands.describe(暱稱="你想要設定的暱稱")
-async def slash_nick(interaction: discord.Interaction, 暱稱: str):
-    nicknames[str(interaction.user.id)] = 暱稱
+@tree.command(name="nick", description="設定暱稱（預設為自己；主人可指定對象）")
+@app_commands.describe(暱稱="要設定的暱稱", 對象="目標成員（主人限定，預設為自己）")
+async def slash_nick(interaction: discord.Interaction, 暱稱: str, 對象: discord.Member = None):
+    is_master = (interaction.user.id == MASTER_ID)
+    target = 對象 or interaction.user
+
+    if target.id != interaction.user.id and not is_master:
+        await interaction.response.send_message('你只能設定自己的暱稱喵！', ephemeral=True)
+        return
+
+    nicknames[str(target.id)] = 暱稱
     save_nicknames(nicknames)
-    await interaction.response.send_message(f'好的，我會記住你叫「{暱稱}」！', ephemeral=True)
+
+    if target.id == interaction.user.id:
+        await interaction.response.send_message(f'好的，我會記住你叫「{暱稱}」！', ephemeral=True)
+    else:
+        await interaction.response.send_message(f'已將 {target.mention} 的暱稱設為「{暱稱}」。', ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -189,61 +200,6 @@ def _init_session(cid: int, personality: str, sess: dict | None) -> None:
         'raw_history': raw_history,
         'current_web_context': web_context,
     }
-
-
-# ---------------------------------------------------------------------------
-# !nick 文字指令（主人管理用）
-#   !nick 列表                          → 列出所有暱稱
-#   !nick 設定 <@user|user_id> <暱稱>   → 設定暱稱（主人：任意；訪客：僅限自己）
-#   !nick 刪除 <@user|user_id>          → 刪除暱稱（主人限定）
-# ---------------------------------------------------------------------------
-async def handle_nick_command(msg: discord.Message, args: str) -> None:
-    global nicknames
-
-    args = args.strip()
-    is_master = (msg.author.id == MASTER_ID)
-
-    if args in ('列表', 'list') and is_master:
-        if not nicknames:
-            await msg.reply('目前沒有任何已登記的暱稱。')
-        else:
-            lines = '\n'.join(f'`{uid}` → {nick}' for uid, nick in nicknames.items())
-            await msg.reply(f'**已登記暱稱清單：**\n{lines}')
-        return
-
-    if args.startswith('設定 ') or args.startswith('設定　'):
-        parts = args[3:].strip().split(None, 1)
-        if len(parts) < 2:
-            await msg.reply('語法：`!nick 設定 <@user 或 user_id> <暱稱>`')
-            return
-        target_raw, new_nick = parts[0], parts[1].strip()
-        target_id = _parse_user_id(target_raw, msg)
-        if target_id is None:
-            await msg.reply('無法辨識目標用戶，請使用 @提及 或直接輸入 user_id。')
-            return
-        if not is_master and target_id != msg.author.id:
-            await msg.reply('你只能設定自己的暱稱喔。')
-            return
-        nicknames[str(target_id)] = new_nick
-        save_nicknames(nicknames)
-        await msg.reply(f'已將 `{target_id}` 的暱稱設為「{new_nick}」。')
-        return
-
-    if (args.startswith('刪除 ') or args.startswith('刪除　')) and is_master:
-        target_id = _parse_user_id(args[3:].strip(), msg)
-        if target_id is None:
-            await msg.reply('無法辨識目標用戶。')
-            return
-        uid_str = str(target_id)
-        if uid_str in nicknames:
-            removed = nicknames.pop(uid_str)
-            save_nicknames(nicknames)
-            await msg.reply(f'已刪除 `{target_id}` 的暱稱（原為「{removed}」）。')
-        else:
-            await msg.reply(f'`{target_id}` 沒有登記暱稱。')
-        return
-
-    await msg.reply('語法：`!nick 列表` / `!nick 設定 <user> <暱稱>` / `!nick 刪除 <user>`')
 
 
 # ---------------------------------------------------------------------------
@@ -380,11 +336,6 @@ async def on_message(msg: discord.Message) -> None:
         await msg.reply('主...主人...請問...需...需要什麼協助嗎？喵嗚...')
         return
 
-    # --- !nick 指令攔截（不送 Gemini）---
-    if raw_text.startswith('!nick ') or raw_text.startswith('!nick　'):
-        await handle_nick_command(msg, raw_text[6:])
-        return
-
     # --- !kb 指令攔截（不送 Gemini）---
     if raw_text.startswith('!kb ') or raw_text.startswith('!kb　'):
         await handle_kb_command(msg, raw_text[4:])
@@ -450,6 +401,7 @@ async def on_message(msg: discord.Message) -> None:
             file_parts[-1]['data'], file_parts[-1]['mime_type']
         )
         await msg.channel.send(f'**以圖搜圖結果：**\n{search_results}')
+        prompt = f'[以圖搜圖結果]\n{search_results}\n\n用戶問題：{prompt}'
 
     # --- URL 偵測 ---
     if url_match := re.search(r'https?://\S+', prompt):

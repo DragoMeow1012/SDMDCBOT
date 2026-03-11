@@ -8,30 +8,6 @@ from bs4 import BeautifulSoup
 
 _MAX_CONTENT_LENGTH = 2000
 
-_PIXIV_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
-    'Referer': 'https://www.pixiv.net/',
-}
-
-
-async def fetch_pixiv_image(url: str) -> bytes | None:
-    """
-    抓取 Pixiv 圖片二進位資料（i.pximg.net）。
-    帶上 Referer: https://www.pixiv.net/ 繞過防盜連限制。
-    成功回傳 bytes；失敗回傳 None。
-    """
-    try:
-        resp = await asyncio.to_thread(
-            requests.get, url,
-            headers=_PIXIV_HEADERS,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return resp.content
-    except Exception as e:
-        print(f'[PIXIV] 圖片抓取失敗 {url}: {e}')
-        return None
-
 
 async def fetch_url(url: str) -> str:
     """
