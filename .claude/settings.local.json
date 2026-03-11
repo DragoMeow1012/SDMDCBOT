@@ -41,7 +41,10 @@
       "WebFetch(domain:gist.githubusercontent.com)",
       "WebFetch(domain:gist.github.com)",
       "Bash(pip install:*)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(python main.py)",
+      "Bash(find . -name .env* -type f)",
+      "Bash(wc -l /d/vsc/DCbot_1.0/*.py)"
     ]
   }
 }

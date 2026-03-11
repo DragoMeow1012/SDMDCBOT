@@ -79,9 +79,9 @@ def save_history(chat_sessions: dict) -> None:
             else:
                 hist = sess.get('raw_history', [])
 
-            # 超出上限時保留最新的 HISTORY_MAX_TURNS 筆
+            # 超出上限時原位刪除最舊的紀錄
             if len(hist) > HISTORY_MAX_TURNS:
-                hist = hist[-HISTORY_MAX_TURNS:]
+                del hist[:-HISTORY_MAX_TURNS]
 
             data[str(cid)] = {
                 'raw_history': hist,

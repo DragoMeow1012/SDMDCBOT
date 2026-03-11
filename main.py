@@ -372,6 +372,9 @@ async def on_message(msg: discord.Message) -> None:
             mime = mime.split(';')[0].strip()
 
             if mime in _INLINE_MIME_TYPES:
+                if attachment.size > 20 * 1024 * 1024:
+                    await msg.reply(f'`{attachment.filename}` 檔案過大（{attachment.size / 1024 / 1024:.1f} MB），最大支援 20 MB 喵！')
+                    continue
                 try:
                     data = await attachment.read()
                     file_parts.append({'data': data, 'mime_type': mime})
@@ -404,7 +407,7 @@ async def on_message(msg: discord.Message) -> None:
         prompt = f'[以圖搜圖結果]\n{search_results}\n\n用戶問題：{prompt}'
 
     # --- URL 偵測 ---
-    if url_match := re.search(r'https?://\S+', prompt):
+    if url_match := re.search(r'https?://[^\s\)\]\>\"\'`]+(?<![.,;:!?])', prompt):
         url: str = url_match.group(0)
         query: str = prompt.replace(url, '').strip()
 

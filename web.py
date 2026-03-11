@@ -17,7 +17,7 @@ async def fetch_url(url: str) -> str:
     """
     try:
         resp = await asyncio.to_thread(
-            requests.get, url, timeout=10,
+            requests.get, url, timeout=(5, 15),
             headers={"User-Agent": "Mozilla/5.0"}
         )
         resp.raise_for_status()

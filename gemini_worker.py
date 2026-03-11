@@ -31,16 +31,18 @@ def rotate_api_key() -> None:
 _client = _create_client()
 
 # --- 各人格的對話設定 ---
-_SEARCH_TOOL = types.Tool(google_search=types.GoogleSearch())
+# Lite 模型不支援 google_search grounding tool
+_supports_search = 'lite' not in GEMINI_MODEL_NAME.lower()
+_tools = [types.Tool(google_search=types.GoogleSearch())] if _supports_search else []
 
 _CHAT_CONFIGS: dict[str, types.GenerateContentConfig] = {
     'general': types.GenerateContentConfig(
         system_instruction=PERSONALITY['general'],
-        tools=[_SEARCH_TOOL],
+        tools=_tools,
     ),
     'master': types.GenerateContentConfig(
         system_instruction=PERSONALITY['master'],
-        tools=[_SEARCH_TOOL],
+        tools=_tools,
     ),
 }
 
