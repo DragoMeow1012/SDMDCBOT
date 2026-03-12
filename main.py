@@ -488,7 +488,7 @@ async def on_message(msg: discord.Message) -> None:
         content = await fetch_url(url)
 
         if content.startswith('錯誤:') or not content:
-            await msg.reply('喵嗚... 抓取網頁失敗了')
+            print(f'[WEB] 抓取失敗: {url}')
         else:
             chat_sessions[cid]['current_web_context'] = content
             await msg.reply('喵嗚！已成功抓取網頁內容囉！')
@@ -524,15 +524,35 @@ async def on_message(msg: discord.Message) -> None:
         'channel_id': cid,
         'prompt_text': final_prompt,
         'file_parts': file_parts,
-        'message_object': msg,
+        'reply_fn': msg.reply,
+        'send_fn': msg.channel.send,
+        'typing_ctx': msg.channel.typing(),
         'kb_save': kb_save,
     })
+
+
+async def _main() -> None:
+    """同時啟動 Discord Bot 與 LINE Webhook Server（若已設定）。"""
+    from config import LINE_CHANNEL_ACCESS_TOKEN, LINE_WEBHOOK_PORT
+    from line_bot import start_line_server
+
+    tasks = []
+    if LINE_CHANNEL_ACCESS_TOKEN:
+        tasks.append(asyncio.create_task(
+            start_line_server(chat_sessions, knowledge_entries, LINE_WEBHOOK_PORT, _init_session)
+        ))
+
+    async with client:
+        await client.start(DISCORD_TOKEN)
+
+    for t in tasks:
+        t.cancel()
 
 
 if __name__ == '__main__':
     try:
         print('Connecting to Discord...')
-        client.run(DISCORD_TOKEN)
+        asyncio.run(_main())
     except discord.errors.LoginFailure:
         print('[ERROR] Invalid Discord Bot Token. Check your .env file.')
     except KeyboardInterrupt:

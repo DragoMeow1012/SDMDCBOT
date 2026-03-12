@@ -38,7 +38,12 @@ def load_history() -> dict:
 
         sessions: dict = {}
         for cid_str, sess_data in data.items():
-            sessions[int(cid_str)] = {
+            # Discord 頻道 ID 為純數字；LINE 使用 'line_...' 字串 key
+            try:
+                cid = int(cid_str)
+            except ValueError:
+                cid = cid_str
+            sessions[cid] = {
                 'chat_obj': None,
                 'model': None,
                 'raw_history': sess_data.get('raw_history', []),
@@ -91,9 +96,13 @@ def save_history(chat_sessions: dict) -> None:
         with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-        # 同步更新各頻道的可讀 TXT 摘要
+        # 同步更新各頻道的可讀 TXT 摘要（LINE string key 直接傳入）
         for cid_str, sess_data in data.items():
-            save_summary(int(cid_str), sess_data.get('raw_history', []))
+            try:
+                cid_key = int(cid_str)
+            except ValueError:
+                cid_key = cid_str
+            save_summary(cid_key, sess_data.get('raw_history', []))
 
         print(f"✅ 歷史已存: {HISTORY_FILE}")
 

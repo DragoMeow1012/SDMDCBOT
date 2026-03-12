@@ -38,7 +38,7 @@ def _hist_to_lines(hist: list[dict]) -> list[str]:
     return lines
 
 
-def save_summary(channel_id: int, hist: list[dict]) -> None:
+def save_summary(channel_id: int | str, hist: list[dict]) -> None:
     """
     將 hist（raw_history 格式）序列化為 TXT 並儲存。
     只保留最後 MAX_LINES 條。
@@ -62,7 +62,7 @@ def save_summary(channel_id: int, hist: list[dict]) -> None:
         print(f"[SUMMARY] 儲存失敗 ch={channel_id}: {e}")
 
 
-def load_summary(channel_id: int) -> str | None:
+def load_summary(channel_id: int | str) -> str | None:
     """
     讀取頻道對話摘要 TXT，回傳字串；檔案不存在則回傳 None。
     """

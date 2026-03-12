@@ -17,4 +17,6 @@ RUN python -m pip install --no-cache-dir -r requirements.txt \
 COPY . .
 RUN mkdir -p /app/data && touch /app/data/chat_history.json
 
+EXPOSE 8080
+
 CMD ["python", "-u", "main.py"]

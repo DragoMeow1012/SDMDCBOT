@@ -187,10 +187,12 @@ async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = No
 
     while True:
         req = await msg_queue.get()
-        cid: int = req['channel_id']
+        cid = req['channel_id']
         prompt: str = req['prompt_text']
         file_parts: list[dict] = req.get('file_parts', [])
-        msg = req['message_object']
+        reply_fn = req['reply_fn']      # async fn(text) → 回覆原訊息
+        send_fn = req['send_fn']        # async fn(text) → 發送至頻道（分段/通知用）
+        typing_ctx = req['typing_ctx']  # async context manager（LINE 為 no-op）
         kb_save: dict | None = req.get('kb_save')
 
         try:
@@ -207,7 +209,7 @@ async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = No
             if elapsed < API_DELAY:
                 await asyncio.sleep(API_DELAY - elapsed)
 
-            async with msg.channel.typing():
+            async with typing_ctx:
                 max_attempts = len(GEMINI_API_KEYS)
                 for attempt in range(max_attempts):
                     try:
@@ -228,17 +230,17 @@ async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = No
                         if not text:
                             fallback = _reverse_search_fallback(prompt)
                             if fallback:
-                                await msg.reply(fallback)
+                                await reply_fn(fallback)
                             else:
-                                await msg.reply('喵嗚... 這個問題我沒辦法回答')
+                                await reply_fn('喵嗚... 這個問題我沒辦法回答')
                             break
 
                         if len(text) > 2000:
-                            await msg.reply("我的回應太長了，我會分段傳送：")
+                            await send_fn("我的回應太長了，我會分段傳送：")
                             for i in range(0, len(text), 1990):
-                                await msg.channel.send(text[i:i + 1990])
+                                await send_fn(text[i:i + 1990])
                         else:
-                            await msg.reply(text)
+                            await reply_fn(text)
 
                         # 自動將圖片分析結果儲存至知識庫
                         if kb_save:
@@ -248,7 +250,7 @@ async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = No
                                     f"[圖片分析 {kb_save['label']}]: {text[:800]}",
                                     kb_save['saved_by'],
                                 )
-                                await msg.channel.send(
+                                await send_fn(
                                     f"📌 圖片分析已自動儲存至知識庫 `#{entry['id']}`，之後可以直接問我喵！"
                                 )
                             except Exception as e:
@@ -277,13 +279,13 @@ async def gemini_worker(chat_sessions: dict, knowledge_entries: list | None = No
                                 continue  # 靜默重試
                             else:
                                 print(f"[ERROR] 所有 {max_attempts} 組 Key 均已耗盡 ch={cid}")
-                                await msg.reply("所有 API Key 都達到用量限制了喵...請稍後再試！")
+                                await reply_fn("所有 API Key 都達到用量限制了喵...請稍後再試！")
                         elif "timeout" in err:
                             print(f"[WARN] API逾時 ch={cid}: {e}")
-                            await msg.reply("喵嗚...Gemini API 回應時間太長了，請稍後再試試看喔！")
+                            await reply_fn("喵嗚...Gemini API 回應時間太長了，請稍後再試試看喔！")
                         else:
                             print(f"[ERROR] {type(e).__name__}: {e}")
-                            await msg.reply("抱歉，我在處理您的請求時遇到了未知的錯誤喵。")
+                            await reply_fn("抱歉，我在處理您的請求時遇到了未知的錯誤喵。")
                         break  # 非 quota 錯誤不重試
 
         finally:

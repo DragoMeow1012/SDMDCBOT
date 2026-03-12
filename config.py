@@ -26,6 +26,11 @@ if not DISCORD_TOKEN:
 if not GEMINI_API_KEYS:
     raise ValueError("❌ 缺少至少一組 GEMINI_API_KEY，請在 .env 中設定")
 
+# --- LINE Bot（選填，不設定則不啟動 LINE 功能）---
+LINE_CHANNEL_ACCESS_TOKEN: str = os.getenv('LINE_CHANNEL_ACCESS_TOKEN', '')
+LINE_CHANNEL_SECRET: str = os.getenv('LINE_CHANNEL_SECRET', '')
+LINE_WEBHOOK_PORT: int = int(os.getenv('LINE_WEBHOOK_PORT', '8080'))
+
 # --- Gemini 模型 ---
 GEMINI_MODEL_NAME = "gemini-2.5-flash"
 API_DELAY = 5.0          # 每次 API 請求之間的最短間隔（秒）
