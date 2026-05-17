@@ -243,12 +243,6 @@ def _lmstudio_get_model_id() -> str:
     _lmstudio_model_cache = "local-model"
     return _lmstudio_model_cache
 
-
-
-# _filter_ghost_stores, _suppress_url_embeds, _strip_thinking_output
-# 已移至 utils/text_processing.py，透過 postprocess_response() 統一呼叫。
-
-
 def _lmstudio_chat_completion(messages: list[dict[str, str]]) -> str:
     url = f"{LM_STUDIO_BASE_URL}/v1/chat/completions"
     headers = {"Content-Type": "application/json"}

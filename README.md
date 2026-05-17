@@ -1,24 +1,22 @@
 # 小龍喵 Discord Bot
 
-基於 Gemini AI 的 Discord / LINE 聊天機器人，支援多角色人格、暱稱系統、知識庫、網頁抓取、圖片反搜、對話記憶跨重啟保留，以及大規模 Pixiv 圖片爬蟲。
+基於 Gemini AI 的 Discord / LINE 聊天機器人，支援雙人格、本地 / 雲端 AI 雙 provider、漫畫翻譯、網頁抓取、圖片反搜、對話記憶跨重啟保留，以及大規模 Pixiv 圖片爬蟲。
 
 ---
 
 ## 功能
 
-- **AI 對話**：使用 Gemini 2.5 Flash，@提及即可對話
-- **雙人格模式**：主人（龍龍喵）與一般訪客使用不同人格設定
+- **AI 對話**：Gemini 2.5 Flash 線上 + LM Studio 本地雙 provider，`/ai模型` 隨時切換；@提及即可對話
+- **雙人格模式**：主人（龍龍喵）與一般訪客使用不同人格設定（[config.py](config.py) `PERSONALITY`）
 - **對話記憶**：歷史儲存於 `data/chat_history.json`，重啟自動載入
 - **對話摘要**：自動序列化為 TXT（`data/summaries/`），供模型跨 session 參考
-- **暱稱系統**：每位用戶可設定暱稱，模型優先用暱稱稱呼
-- **知識庫**：永久儲存跨頻道知識條目，支援文字或檔案 AI 分析
 - **網頁抓取**：訊息附上 URL 自動抓取並摘要或回答問題
-- **圖片反搜**：`/以圖搜圖` 或關鍵字觸發反向圖片搜尋
-- **名言佳句**：右鍵訊息生成 1920×1080 精美引言圖
-- **LINE 整合**：支援 LINE Bot Webhook，LINE 聊天也能與 Gemini 對話
-- **電子口球**：對成員套用全伺服器禁言（Timeout）
-- **API Key 輪替**：支援最多 7 組 Gemini API Key（`GEMINI_API_KEY` 至 `GEMINI_API_KEY6`），超出限制自動切換
-- **Pixiv 爬蟲**：全站 tag／ranking／作者擴散爬取，pHash 去重，FAISS 二值索引，支援指定作者優先爬取
+- **圖片反搜**：`/以圖搜圖` 或附圖關鍵字觸發反向圖片搜尋（SauceNAO + soutubot）
+- **漫畫翻譯**：`/translate-img` — 圖片或整本壓縮檔（zip/cbz/rar/cbr），背後接自家 fork 的 [manga-image-translator](../manga-image-translator) HTTP server
+- **名言佳句**：右鍵訊息生成 1920×1080 精美引言圖（Pillow，左頭像漸層 + 右文字）
+- **LINE 整合**：LINE Bot Webhook，LINE 聊天也能與 Gemini 對話（`@小龍喵` 觸發）
+- **API Key 輪替**：支援最多 7 組 Gemini API Key（`GEMINI_API_KEY` 至 `GEMINI_API_KEY6`），429 / 5xx 自動切換
+- **Pixiv 爬蟲**：全站 tag／ranking／作者擴散爬取，pHash + FAISS 二值索引去重，支援指定作者優先佇列
 
 ---
 
@@ -32,14 +30,14 @@ DCbot_1.0/
 ├── gemini_worker.py           # Gemini API Worker、模型初始化、Key 輪替
 ├── ai_session.py              # AI 供應商抽象層（Gemini / LM Studio）
 ├── history.py                 # 本地聊天歷史讀寫；atomic write + save_history_async
-├── nicknames.py               # 暱稱系統（load/save/build context）
-├── knowledge.py               # 知識庫（data/knowledge.json）
 ├── summary.py                 # 對話摘要序列化（data/summaries/）
 ├── web.py                     # 非同步網頁抓取（aiohttp + BeautifulSoup）
-├── line_bot.py                # LINE Bot Webhook 伺服器（port 8080）
+├── line_bot.py                # LINE Bot Webhook 伺服器
 ├── reverse_search.py          # 圖片反向搜尋（SauceNAO + soutubot）
 ├── quote_image.py             # 名言佳句圖片生成（Pillow，1920×1080）
 ├── graph_render.py            # 本群關係圖網絡渲染（matplotlib + networkx）
+├── manga_translate.py         # 漫畫翻譯 HTTP client（接 manga-image-translator server）
+├── manga_translator_server.py # manga-image-translator server 子進程管理
 ├── logger.py                  # 統一 logging 設定
 ├── pixiv_crawler/             # Pixiv 全站非同步爬蟲套件（asyncio + aiohttp + AppPixivAPI）
 ├── pixiv_feature.py           # pHash 特徵提取 + FAISS 二值索引管理
@@ -51,33 +49,35 @@ DCbot_1.0/
 │   ├── discord_helpers.py     # Discord 成員查詢、權限判斷
 │   ├── ai_helpers.py          # AI 回呼、錯誤訊息格式化
 │   └── text_processing.py     # 預編譯正則、文字清理
-├── commands/                  # 斜線指令套件
+├── commands/                  # 斜線指令套件（多數已合併為單指令 + 選項參數）
 │   ├── __init__.py            # setup_all(tree) 統一注冊
-│   ├── admin.py               # /清除記憶、/清空知識庫
-│   ├── ai.py                  # AI 相關指令（provider 切換等）
-│   ├── nick.py                # /nick
-│   ├── gag.py                 # /電子口球、/口球輪盤
-│   ├── fun.py                 # /電子氣泡紙、/電子木魚、/電子木魚功德排行榜
-│   │                          # /賽博體重計、/擲硬幣、/擲硬幣幹話版
-│   ├── social.py              # /認養寵物、/認主人、/本群關係圖、/賽博釣群友
-│   ├── artillery.py           # /炮決蘿莉控、/炮決排行、/清除炮決名單
-│   ├── quote.py               # 右鍵選單：名言佳句、Make it Quote
-│   ├── search.py              # /以圖搜圖
-│   ├── kb.py                  # /kb 群組（add/remove/list/load）、!kb 文字指令
-│   ├── whip.py                # 電子鞭子：鞭打群友
-│   ├── wife.py                # /抽今日媽媽、/認媽媽、/拋棄兒子、/和今日媽媽斷絕關係
-│   └── pixiv.py               # /pixiv爬蟲、/pixiv停止、/pixiv狀態
-├── data/
-│   ├── chat_history.json      # 各頻道對話歷史（自動生成）
-│   ├── nicknames.json         # 用戶暱稱（自動生成）
-│   ├── knowledge.json         # 知識庫條目（自動生成）
-│   ├── merit.json             # 電子木魚功德記錄（自動生成）
-│   ├── relationships.json     # 主寵關係（自動生成）
-│   ├── artillery_records.json # 炮決記錄（自動生成）
-│   ├── summaries/             # 各頻道對話摘要 TXT
+│   ├── admin.py               # /清除記憶
+│   ├── ai.py                  # /ai模型 — 切換 Gemini 雲端 / LM Studio 本地
+│   ├── translate.py           # /translate-img — 翻譯圖片或壓縮檔（zip/cbz/rar/cbr）
+│   ├── image_search.py        # /以圖搜圖
+│   ├── nhentai.py             # /random-nhentai — NSFW 頻道專用
+│   ├── daily_mom.py           # /抽今日媽媽
+│   ├── pixiv.py               # /pixiv 選項=[爬蟲|狀態|停止]
+│   ├── relationship.py        # /relationship 選項=[認養寵物|認主人|放生寵物|本群關係圖|
+│   │                          #   認媽媽|拋棄兒子|和今日媽媽斷絕關係|電子皮鞭|解除調教|炮決蘿莉控]
+│   ├── tool.py                # /tool 選項=[電子口球|口球輪盤|電子氣泡紙|電子木魚|
+│   │                          #   賽博體重計|擲硬幣|擲硬幣幹話版|roll|丟骰子|分隊伍|賽博釣群友]
+│   ├── rank.py                # /rank 選項=[功德|炮決|調教|清除]
+│   └── quote.py               # 右鍵選單：「名言佳句」、「Make it Quote」
+├── data/                      # 全部 runtime 狀態檔（自動生成；JSON 採 atomic write）
+│   ├── chat_history.json      # 各頻道對話歷史
+│   ├── summaries/             # 各頻道對話摘要 TXT（給跨 session 注入）
+│   ├── merit.json             # 電子木魚功德
+│   ├── artillery_records.json # 炮決次數
+│   ├── whip_records.json      # 調教（電子皮鞭）次數
+│   ├── whip_relations.json    # 調教關係（trainer → trainee）
+│   ├── relationships.json     # 主寵關係
+│   ├── wife_records.json      # 今日媽媽（跨日自動清除）
 │   ├── picture/
 │   │   └── artillerylolicon.jpg
-│   └── bot.log                # 執行 log（背景啟動時產生）
+│   └── logs/
+│       ├── bot_YYYY-MM-DD.log         # bot 主 log（依日期切檔）
+│       └── manga_translator_server.log  # manga-image-translator 子進程 log（>50MB 滾 .old）
 ├── pixivdata/                 # Pixiv 爬蟲資料根目錄（自動生成）
 │   ├── images/                # 下載的圖片（按 illust_id 子目錄）
 │   ├── data/
@@ -126,29 +126,59 @@ copy .env.example .env
 編輯 `.env`：
 
 ```env
+# === Discord（必填）===
 DISCORD_BOT_TOKEN=你的_Discord_Bot_Token
-GEMINI_API_KEY=你的_Gemini_API_Key
-GEMINI_API_KEY1=備用Key1（可選）
-GEMINI_API_KEY2=備用Key2（可選）
-GEMINI_API_KEY3=備用Key3（可選）
-GEMINI_API_KEY4=備用Key4（可選）
-GEMINI_API_KEY5=備用Key5（可選）
-GEMINI_API_KEY6=備用Key6（可選）
 
-# Pixiv 爬蟲（可選，設定後可使用 /pixiv爬蟲）
-PIXIV_REFRESH_TOKEN=你的_Pixiv_Refresh_Token
-PIXIV_WEB_COOKIE=你的_Pixiv_Web_Cookie（可選，提升搜尋配額）
-NGROK_AUTH_TOKEN=你的_ngrok_Token（可選，狀態頁面公開存取）
+# === Gemini API Keys（最多 7 組輪替；雲端 AI 必填至少 1 組）===
+GEMINI_API_KEY=你的_主要_Gemini_API_Key
+GEMINI_API_KEY1=備用_Key_1
+GEMINI_API_KEY2=備用_Key_2
+# ... 最多到 GEMINI_API_KEY6
 
-# LINE Bot（可選）
+# === AI provider（可選；預設 gemini）===
+AI_PROVIDER_DEFAULT=gemini             # gemini 或 lmstudio
+LM_STUDIO_BASE_URL=http://127.0.0.1:1234
+LM_STUDIO_MODEL=                       # 留空 = 自動抓 /v1/models 第一個
+LM_STUDIO_API_KEY=                     # LM Studio 預設不檢查
+LM_STUDIO_MAX_CONTEXT_CHARS=12000
+
+# === 漫畫翻譯（manga-image-translator 後端，可選）===
+MANGA_TRANSLATOR_AUTOSTART=1           # 1=bot 啟動時 spawn server 子進程
+MANGA_TRANSLATOR_DIR=d:\VScode\manga-image-translator
+MANGA_TRANSLATOR_PYTHON=d:\VScode\manga-image-translator\.venv\Scripts\python.exe
+MANGA_TRANSLATOR_URL=http://127.0.0.1:8001
+MANGA_TRANSLATOR_USE_GPU=1
+MANGA_TRANSLATOR_NUM_WORKERS=2         # 每個 worker 各佔一份 VRAM
+MANGA_TRANSLATOR_CONCURRENCY=10        # bot 端 in-flight 上限 = N×K
+MANGA_TRANSLATOR_USE_LOCAL=0           # 0=Gemini 雲端、1=本地 LM Studio
+MANGA_TRANSLATOR_GEMINI_MODEL=gemini-3-flash-preview
+MANGA_TRANSLATOR_OPENAI_MODEL=qwen2.5-vl-7b-instruct
+MANGA_TRANSLATOR_FONT=Arial-Unicode-Regular.ttf
+
+# === Pixiv 爬蟲（可選；不填則 /pixiv 指令會回未設定錯誤）===
+PIXIV_REFRESH_TOKEN=你的_主要_token
+PIXIV_REFRESH_TOKEN1=備用_token_1      # 多組會分配給 main / scan / diffusion workers
+PIXIV_WEB_COOKIE=你的_Pixiv_Web_Cookie  # 可選，提升搜尋配額
+NGROK_AUTH_TOKEN=                      # 可選，公開狀態頁
+NGROK_DOMAIN=                          # 可選，固定 ngrok 子網域
+
+# === SauceNAO（可選；提升 200 次/天配額）===
+SAUCENAO_API_KEY=
+
+# === imsearch 本機搜圖伺服器（可選）===
+IMSEARCH_URL=http://127.0.0.1:8000
+
+# === LINE Bot（可選）===
 LINE_CHANNEL_ACCESS_TOKEN=你的_LINE_Channel_Access_Token
 LINE_CHANNEL_SECRET=你的_LINE_Channel_Secret
+LINE_WEBHOOK_PORT=8080
 ```
 
 - Discord Token：[Discord Developer Portal](https://discord.com/developers/applications)
 - Gemini API Key：[Google AI Studio](https://aistudio.google.com/apikey)
 - Pixiv Refresh Token：使用 [pixivpy3](https://github.com/upbit/pixivpy) 的 `refresh_token` 取得方式取得
 - LINE Token：[LINE Developers Console](https://developers.line.biz/)
+- SauceNAO Key：[SauceNAO 註冊頁](https://saucenao.com/user.php)
 
 ---
 
@@ -215,7 +245,7 @@ docker compose up -d
 | `@小龍喵 你好` | 一般對話 |
 | `@小龍喵 https://example.com` | 抓取網頁並摘要 |
 | `@小龍喵 https://example.com 這篇說什麼？` | 抓取後依問題回答 |
-| 附圖 + `@小龍喵` | 圖片分析並自動存入知識庫 |
+| 附圖 + `@小龍喵` | 圖片分析（多模態） |
 | 附圖 + `@小龍喵 來源？` | 自動觸發反向圖片搜尋 |
 
 ---
@@ -226,85 +256,81 @@ docker compose up -d
 
 | 指令 | 說明 | 權限 |
 |------|------|------|
-| `/nick 暱稱` | 設定自己的暱稱（模型稱呼用） | 所有人 |
-| `/nick 暱稱 對象` | 設定指定成員的暱稱 | 主人限定 |
-| `/清除記憶` | 清除所有頻道的聊天記憶 | 主人限定 |
+| `/ai模型 model:[線上\|本地]` | 切換本頻道的 AI provider；本地走 LM Studio、線上走 Gemini | 所有人 |
+| `/清除記憶` | 清除本頻道聊天記憶（被安全過濾卡住時用） | 主人限定 |
 
-### 知識庫
-
-| 指令 | 說明 | 權限 |
-|------|------|------|
-| `/kb add 文字` | 新增文字到知識庫 | 所有人 |
-| `/kb add 檔案` | 上傳檔案由 AI 分析後儲存 | 所有人 |
-| `/kb remove 節次` | 刪除指定節次 | 主人限定 |
-| `/kb list` | 列出所有節次 | 主人限定 |
-| `/kb load` | 重新載入並注入當前頻道 | 所有人 |
-| `/清空知識庫` | 清空所有知識庫條目 | 主人限定 |
-
-### 搜尋與圖片
+### 翻譯與圖像
 
 | 指令 | 說明 | 權限 |
 |------|------|------|
-| `/以圖搜圖 圖片` | 用截圖找來源（pixiv/twitter/x/nh） | 所有人 |
-| 右鍵 → `名言佳句` | 將訊息製成名言圖（1920×1080） | 所有人 |
-| 右鍵 → `Make it Quote` | 同上（英文選單） | 所有人 |
+| `/translate-img 圖片1..10` | 翻譯圖片附件（最多 10 張），支援多語言 | 所有人 |
+| `/translate-img 壓縮檔` | 翻譯整本漫畫 zip / cbz / rar / cbr，回傳譯後 zip；超過 Discord 上限自動上傳 litterbox（72h 暫存） | 所有人 |
+| `/以圖搜圖 圖片` | 用截圖找來源（pixiv / twitter / x / nh） | 所有人 |
+| 右鍵 → `名言佳句` / `Make it Quote` | 將訊息製成 1920×1080 名言圖 | 所有人 |
+| `/random-nhentai [tag] [限定中文]` | 從 nhentai 隨機抽一本，可選 tag、可只抽中文版 | NSFW 頻道 |
 
-### Pixiv 爬蟲
+### Pixiv 爬蟲（`/pixiv 選項`）
 
-| 指令 | 說明 | 權限 |
+| 選項 | 說明 | 權限 |
 |------|------|------|
-| `/pixiv爬蟲` | 開始全站背景爬取（tag + ranking + 作者擴散） | 主人限定 |
-| `/pixiv爬蟲 作者ID` | 將指定 Pixiv 作者加入優先爬取佇列；爬蟲未啟動時自動啟動 | 主人限定 |
-| `/pixiv停止` | 停止背景爬取（優雅等待當前批次完成後停止） | 主人限定 |
-| `/pixiv狀態` | 查看爬取狀態、作品統計、本輪進度，以及 Streamlit 狀態頁 URL | 所有人 |
+| `爬蟲` | 開始背景爬取（不填 author_id = 全站；填 = 該作者優先） | 主人限定 |
+| `狀態` | 查看作品統計、本輪進度，附 Streamlit 即時狀態頁 URL | 所有人 |
+| `停止` | 優雅停止當前批次 | 主人限定 |
 
-### 娛樂
+### 工具與娛樂（`/tool 選項`）
 
-| 指令 | 說明 | 權限 |
+| 選項 | 說明 | 權限 |
 |------|------|------|
-| `/擲硬幣` | 擲一枚硬幣，正面或反面 | 所有人 |
-| `/擲硬幣幹話版` | 硬幣先歷經奇妙旅程，1~10 句後揭曉結果 | 所有人 |
-| `/電子氣泡紙 尺寸` | 發送可點擊的電子氣泡紙（5×2 / 10×5） | 所有人 |
-| `/電子木魚` | 敲木魚積功德按鈕 | 所有人 |
-| `/電子木魚功德排行榜` | 功德 TOP10 排行榜 | 所有人 |
-| `/賽博體重計` | 量測賽博體重 | 所有人 |
-| `/炮決蘿莉控 [用戶]` | 隨機或指定炮決，並記錄次數 | 所有人 |
-| `/炮決排行` | 被炮決次數 TOP10 | 所有人 |
-| `/清除炮決名單` | 清除本伺服器炮決記錄 | 主人限定 |
+| `電子口球` | 對成員套用 Timeout 禁言（秒數 1~2419200） | 主人直接執行；對他人需確認 |
+| `口球輪盤` | 1 分鐘報名，隨機抽一人禁言 30 秒 | 所有人 |
+| `電子氣泡紙` | 5×2 / 10×5 / 自訂（最大 50×50）可點擊氣泡紙 | 所有人 |
+| `電子木魚` | 敲木魚積功德按鈕 | 所有人 |
+| `賽博體重計` | 量測賽博體重 | 所有人 |
+| `擲硬幣` / `擲硬幣幹話版` | 擲一枚硬幣（幹話版有奇妙旅程 1~10 句） | 所有人 |
+| `roll` | 抽籤；本頻道在線成員隨機一個 | 所有人 |
+| `丟骰子` | 1~6 隨機 | 所有人 |
+| `分隊伍 隊伍數量` | 把語音頻道內的成員隨機分隊（2~20 隊） | 所有人 |
+| `賽博釣群友` | 放出釣魚按鈕，咬鉤者會被偽裝發言（webhook） | 所有人 |
 
-### 社交
+### 關係互動（`/relationship 選項`）
 
-| 指令 | 說明 | 權限 |
+| 選項 | 說明 | 權限 |
 |------|------|------|
-| `/認養寵物 用戶` | 邀請對方成為你的寵物 | 所有人 |
-| `/認主人 用戶` | 邀請對方成為你的主人 | 所有人 |
-| `/本群關係圖` | 視覺化本伺服器的主寵 + 母子關係網路 | 所有人 |
-| `/賽博釣群友` | 放出釣魚按鈕，咬鉤者會被偽裝發言 | 所有人 |
-| `/抽今日媽媽` | 從本群隨機抽一位成員作為你的媽媽（當日限一次） | 所有人 |
-| `/認媽媽 用戶` | 強制指定一位成員作為你的媽媽 | 所有人 |
-| `/拋棄兒子 用戶` | 解除指定用戶認你為媽媽的關係 | 所有人 |
-| `/和今日媽媽斷絕關係` | 與今日抽到的媽媽解除關係 | 所有人 |
-| `/電子鞭子 [用戶]` | 隨機或指定成員鞭打，記錄次數 | 所有人 |
+| `認養寵物` 用戶 | 邀請對方成為你的寵物 | 所有人 |
+| `認主人` 用戶 | 邀請對方成為你的主人 | 所有人 |
+| `放生寵物` 用戶 | 解除主寵關係 | 所有人 |
+| `本群關係圖` | 視覺化本伺服器主寵 + 母子 + 調教關係網（matplotlib + networkx） | 所有人 |
+| `認媽媽` 用戶 | 強制指定一位成員作為你的媽媽 | 所有人 |
+| `拋棄兒子` 用戶 | 解除指定用戶認你為媽媽的關係 | 所有人 |
+| `和今日媽媽斷絕關係` | 與今日抽到的媽媽解除關係 | 所有人 |
+| `電子皮鞭` 用戶 [用戶b] | 鞭打對方；填 用戶b 則 用戶=調教者、用戶b=被調教者 | 所有人 |
+| `解除調教` 用戶 | 解除調教關係 | 所有人 |
+| `炮決蘿莉控` [用戶] | 隨機或指定炮決，記錄次數 | 所有人 |
 
-### 管理
+`/抽今日媽媽` 為獨立指令：每人每日隨機抽一位成員作為今日媽媽。
 
-| 指令 | 說明 | 權限 |
+### 排行榜（`/rank 選項`）
+
+| 選項 | 說明 | 權限 |
 |------|------|------|
-| `/電子口球 time [who]` | 對成員套用 Timeout 禁言 | 主人直接執行，對他人需確認 |
-| `/口球輪盤` | 1分鐘報名，隨機抽一人禁言 30 秒 | 所有人 |
+| `功德` | 電子木魚功德 TOP 10 | 所有人 |
+| `炮決` | 被炮決次數 TOP 10 | 所有人 |
+| `調教` | 被調教次數 TOP 10 | 所有人 |
+| `清除` 清除類型=[功德\|炮決\|調教] | 清除本伺服器指定排行榜 | 主人限定 |
 
 ---
 
 ## 設定說明
 
-### Discord Bot（config.py）
+### Discord Bot（[config.py](config.py)）
 
 | 變數 | 預設值 | 說明 |
 |------|--------|------|
 | `MASTER_ID` | `404111257008865280` | 主人的 Discord 用戶 ID |
-| `GEMINI_MODEL_NAME` | `gemini-2.5-flash` | 使用的 Gemini 模型 |
+| `GEMINI_MODEL_NAME` | `models/gemma-4-31b-it` | 使用的 Gemini 模型（hard-coded） |
 | `API_DELAY` | `5.0` 秒 | 每次 API 請求最短間隔 |
 | `HISTORY_MAX_TURNS` | `150` | 每頻道保留的最大歷史訊息筆數 |
+| `LM_STUDIO_MAX_CONTEXT_CHARS` | `12000` | LM Studio chat messages 字元上限（system + history 合計），超過從最舊歷史開始裁 |
 
 ### Pixiv 爬蟲（pixiv_config.py）
 
@@ -353,7 +379,7 @@ api = AppPixivAPI()
 
 ## 效能與可靠性設計
 
-- **Atomic write**：所有 JSON / TXT 狀態檔（`chat_history.json`、`nicknames.json`、`knowledge.json`、`summaries/*.txt`、`merit.json`、`relationships.json`、`artillery_records.json`、`wife_records.json`、`tag_crawl_progress.json`、`status.json` …）都採用「tmp 檔 + `os.replace`」寫入，確保程式中斷或斷電時不會留下半寫入的壞檔。
+- **Atomic write**：所有 JSON / TXT 狀態檔（`chat_history.json`、`summaries/*.txt`、`merit.json`、`relationships.json`、`wife_records.json`、`whip_records.json`、`whip_relations.json`、`artillery_records.json`、`tag_crawl_progress.json` …）都採用「tmp 檔 + `os.replace`」寫入，確保程式中斷或斷電時不會留下半寫入的壞檔。
 - **非同步存檔**：熱路徑（AI 回覆、訊息送出、爬蟲入庫）使用 `save_json_async` / `save_history_async`，把寫檔丟給 thread pool，不會阻塞 Discord `event loop`。
 - **原生 aiohttp 抓取**：`web.py`、`graph_render.py` 的頭像、`commands/wife.py` 的頭像皆改用 `aiohttp` / `discord.Asset.read()`，取代會 block event loop 的 `requests.get`。
 - **預編譯正則**：`main.py` 的 URL/指令/提及偵測、`utils/text_processing.py` 等熱路徑全部採用 module-level `re.compile`。

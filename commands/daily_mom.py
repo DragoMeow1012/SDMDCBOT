@@ -72,20 +72,20 @@ def setup(tree: app_commands.CommandTree) -> None:
             save_json(_WIFE_FILE, data)
 
         if wife is not None:
-            # mention 在 embed description 內會渲染成可點 @username 連結（不會 ping）
-            mention = wife.mention
+            # 顯示為「顯示名 (@username)」，避免 embed 內單獨 mention 渲染異常
+            display = f'{wife.display_name}\n({wife.mention})'
             asset = wife.display_avatar.replace(size=512)
             try:
                 avatar_bytes = await asset.read()
             except Exception:
                 avatar_bytes = None
         else:
-            mention = '**對方**'
+            display = '**對方**'
             avatar_bytes = None
 
         embed = discord.Embed(
             title='抽今日媽媽',
-            description=f'你今天的媽媽是：{mention}\n要好好對待她哦 {_LOVE_EMOJI}',
+            description=f'你今天的媽媽是：{display}\n要好好對待她哦 {_LOVE_EMOJI}',
             color=discord.Color.pink(),
         )
         if avatar_bytes:

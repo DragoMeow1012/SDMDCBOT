@@ -16,6 +16,9 @@ from commands import (
     tool,
     rank,
     daily_mom,
+    electrocute,
+    morning,
+    gamble,
 )
 
 
@@ -31,3 +34,6 @@ def setup_all(tree: app_commands.CommandTree) -> None:
     tool.setup(tree)
     rank.setup(tree)
     daily_mom.setup(tree)
+    electrocute.setup(tree)
+    morning.setup(tree)
+    gamble.setup(tree)

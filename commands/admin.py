@@ -1,11 +1,11 @@
 """
 管理員指令：/清除記憶
 """
-import json
 import discord
 from discord import app_commands
 
 from config import HISTORY_FILE
+from utils.json_store import load_json, save_json_async
 import state
 
 
@@ -17,13 +17,11 @@ def setup(tree: app_commands.CommandTree) -> None:
         state.chat_sessions.pop(cid, None)
 
         try:
-            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            data.pop(str(cid), None)
-            with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+            data = load_json(HISTORY_FILE)
+            if data.pop(str(cid), None) is not None:
+                await save_json_async(HISTORY_FILE, data)
+        except Exception as e:
+            print(f'[RESET] 寫回 {HISTORY_FILE} 失敗 ch={cid}: {type(e).__name__}: {e}')
 
         embed = discord.Embed(
             title='清除記憶',

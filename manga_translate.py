@@ -47,11 +47,9 @@ _LANG_CODE: dict[str, str] = {
     '한국어':   'KOR',
 }
 
-# 第一次請求 server 要載入 detection / OCR / inpaint 模型，可能 30-60s。
-# K=10 並發下，後到的圖在 worker gpu_lock queue 排隊可能 ~3-5 分鐘才輪到。
-# 600s = 冷啟動 60s + worker 排隊上限 ~5 分鐘 + 慢圖（LLM 偶發掛 100s）+ 緩衝。
-# 超過視為真卡死，由 commands/translate.py 的 _one catch 跳下一張不拖累整批。
-_PER_IMAGE_TIMEOUT = 600
+# 單張 timeout 拉短到 180s（3 分鐘）：與其無限等慢圖，不如標記失敗、最後集中重試。
+# 失敗清單會在 commands/translate.py 走第二輪 retry（仍超時就放棄那張）。
+_PER_IMAGE_TIMEOUT = 180
 _TIMEOUT = aiohttp.ClientTimeout(total=_PER_IMAGE_TIMEOUT)
 
 # Worker 冷啟動時 orchestrator 還沒收到 worker /register（503）或 worker 在載模型（500 + 'starting up'）。
@@ -109,10 +107,6 @@ def _maybe_resize(image_bytes: bytes, mime: str) -> tuple[bytes, str, int]:
         return image_bytes, mime, 0
 
 
-# 向下相容舊呼叫（如果有）
-_maybe_downscale = _maybe_resize
-
-
 def _build_config_payload(target_lang_code: str) -> str:
     """
     產出 manga-translator config JSON。各參數調校 rationale 看底下註解。
@@ -131,13 +125,14 @@ def _build_config_payload(target_lang_code: str) -> str:
         },
         'detector': {
             'detector': 'default',
-            # 1024：從 1280 下調，DBNet 在 1024 對主氣泡仍可抓；省 ~30% detection 時間。
-            # 漫畫主對話氣泡字級夠大不會被漏；極小腳註若需要回 1280。
-            'detection_size': 1024,
+            # 1536：高解析度漫畫頁 (>3MB) 細字密集多框，1024 會把整頁縮太小漏抓。
+            # 1280 對普通頁夠，但成人向密字頁需要 1536 才能不漏細小對話框。
+            # Detection 時間從 1024 → 1536 約多 1.5x，但 GPU 階段不是瓶頸（K=10 並發）。
+            'detection_size': 1536,
             'unclip_ratio': 1.2,
-            # 0.15 → 0.25：拉高過濾更多 false positive 小框，少幾個 region 就少幾次 OCR + LLM token。
-            'text_threshold': 0.25,
-            'box_threshold': 0.25,
+            # 0.15 → 0.20：稍拉高過濾 false positive，但不到 0.25 避免漏框。
+            'text_threshold': 0.20,
+            'box_threshold': 0.20,
             'det_invert': False,
             'det_auto_rotate': False,
             'det_rotate': False,
@@ -218,7 +213,7 @@ async def translate_image(image_bytes: bytes, mime: str, target_lang: str) -> by
 
     target_lang：接受 _LANG_CODE 內中文鍵名，未知預設 CHT。
     """
-    image_bytes, mime, _ = await asyncio.to_thread(_maybe_downscale, image_bytes, mime)
+    image_bytes, mime, _ = await asyncio.to_thread(_maybe_resize, image_bytes, mime)
     code = _LANG_CODE.get(target_lang, 'CHT')
     config_payload = _build_config_payload(code)
     url = f'{MANGA_TRANSLATOR_URL.rstrip("/")}/translate/with-form/image/stream'

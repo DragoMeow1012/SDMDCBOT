@@ -348,7 +348,8 @@ async def _handle_gag(interaction: discord.Interaction, seconds: int | None,
     embed = discord.Embed(
         title='電子口球邀請',
         description=(
-            f'{target.mention}，**{interaction.user.display_name}** '
+            f'**{target.display_name}**\n({target.mention})\n'
+            f'**{interaction.user.display_name}** '
             f'想幫你戴上電子口球 {seconds} 秒，你同意嗎？'
         ),
         color=discord.Color.dark_orange(),

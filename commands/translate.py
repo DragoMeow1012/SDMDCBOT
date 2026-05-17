@@ -17,7 +17,6 @@ import os
 import time
 import traceback
 import zipfile
-from datetime import datetime, timezone
 
 import aiohttp
 import discord
@@ -47,13 +46,16 @@ except ImportError:
     _RAR_AVAILABLE = False
 
 
-# Discord interaction token 15 分鐘後失效，notice.edit() 會 401。
-# 超過這條線就改用 channel.send 發新訊息，避免長批次（webtoon／冷啟動）翻完丟不回去。
-_EDIT_DEADLINE = 720.0
+# Discord 檔案上限隨 boost level 浮動（free 8MB / boosted 50/100MB / Nitro DM 25MB）。
+# `Guild.filesize_limit` 給確切值；DM 或讀不到 fallback 8MB（最保守）。
+# 留 10% 緩衝避免邊緣 413（實測 14.5MB 在某些 server 也會 413）。
+# 超過上限或 413 → 改傳 litterbox.catbox.moe（暫存 72h），Discord 只送下載連結。
+_DISCORD_FILE_LIMIT_FALLBACK_MB = 8.0
 
-# Discord 預設檔案上限 25MB；伺服器 Boost L2 = 50MB、L3 = 100MB。
-# 超過會 413。輸出 zip 超過時要提醒使用者，無法傳上 Discord。
-_DISCORD_FILE_LIMIT_MB = 25
+# litterbox.catbox.moe：catbox.moe 的暫存版本，無 API key 無註冊、單檔 ≤1GB。
+# 過期時間可選 1h / 12h / 24h / 72h；72h 給漫畫批次最寬鬆。
+_LITTERBOX_URL = 'https://litterbox.catbox.moe/resources/internals/api.php'
+_LITTERBOX_RETENTION = '72h'
 
 _MIME_BY_EXT: dict[str, str] = {
     '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
@@ -161,23 +163,127 @@ def _detect_format_ext(image_bytes: bytes) -> str:
     return '.png'
 
 
-def _build_output_zip(results: list[tuple[int, str, bytes | None, str | None]]) -> bytes:
+async def _upload_to_litterbox(zip_bytes: bytes, filename: str) -> str | None:
+    """
+    丟到 litterbox.catbox.moe（catbox 暫存版）。成功回傳 download URL，失敗回 None。
+    無 API key、無註冊；reqtype=fileupload + time={1h,12h,24h,72h} 三 form 欄位即可。
+    超時設 120s 給大檔上傳餘裕（30 張漫畫 ~30-50MB）。
+    """
+    form = aiohttp.FormData()
+    form.add_field('reqtype', 'fileupload')
+    form.add_field('time', _LITTERBOX_RETENTION)
+    form.add_field('fileToUpload', zip_bytes,
+                   filename=filename, content_type='application/zip')
+    timeout = aiohttp.ClientTimeout(total=120)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(_LITTERBOX_URL, data=form) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    print(f'[TRANSLATE-ZIP] litterbox HTTP {resp.status}: {body[:200]}')
+                    return None
+                url = (await resp.text()).strip()
+        if not url.startswith('http'):
+            print(f'[TRANSLATE-ZIP] litterbox 回非 URL: {url[:200]!r}')
+            return None
+        return url
+    except Exception as e:
+        print(f'[TRANSLATE-ZIP] litterbox 上傳失敗: {type(e).__name__}: {e}')
+        traceback.print_exc()
+        return None
+
+
+def _build_output_zip(results: list[tuple[int, str, bytes | None, str | None]]) -> tuple[bytes, int]:
     """
     把翻譯結果打包成 zip。輸入 list 元素：(idx, original_filename, image_bytes, err_str)。
-    err 不是 None 的略過。
+    err 不是 None 或 out 為空（None / b''）的略過。
 
     檔名完全沿用原 zip 的檔名（含副檔名）。server 端 mirror input format → 輸出格式
     跟輸入一致（webp 進就 webp 出），所以延用原檔名安全。原檔名缺失才退回 translated_001。
     輸出 zip 用 ZIP_STORED 不再壓（每張本身已是壓縮過的 webp/jpg/png）。
+
+    回傳 (bytes, written_count)；上層拿 written_count 做 sanity check，避免送出空 zip。
     """
     buf = io.BytesIO()
+    written = 0
     with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
         for idx, name, out, err in results:
-            if err is not None or out is None:
+            if err is not None or not out:
                 continue
             out_name = name if name else f'translated_{idx:03d}{_detect_format_ext(out)}'
             zf.writestr(out_name, out)
-    return buf.getvalue()
+            written += 1
+    return buf.getvalue(), written
+
+
+async def _safe_edit(notice, content: str) -> None:
+    """notice.edit 包 try/except；webhook token 過期、訊息被刪等失敗一律忽略，僅 log。"""
+    try:
+        await notice.edit(content=content)
+    except Exception as e:
+        print(f'[TRANSLATE-ZIP] notice.edit 略過: {type(e).__name__}: {e}')
+
+
+def _get_file_limit_mb(interaction: discord.Interaction) -> float:
+    """讀 guild.filesize_limit 換算 MB；DM 或讀不到 fallback 8MB。留 10% 緩衝避免邊緣 413。"""
+    g = interaction.guild
+    if g is None:
+        return _DISCORD_FILE_LIMIT_FALLBACK_MB
+    try:
+        return max(_DISCORD_FILE_LIMIT_FALLBACK_MB,
+                   g.filesize_limit / 1024 / 1024 * 0.9)
+    except Exception:
+        return _DISCORD_FILE_LIMIT_FALLBACK_MB
+
+
+async def _safe_reply(interaction: discord.Interaction, content: str,
+                      files: list[discord.File] | None = None) -> bool:
+    """
+    回覆原 /translate-img 指令訊息（視覺上有 reply 箭頭關聯）。
+    三層降級：original_response().reply() → channel.send → followup.send。
+    全部失敗才放棄並 log。
+
+    每層 fallback 前都會 file.reset(seek=True) — 否則前一層上傳已經把 BytesIO read 到
+    EOF，下一層送出去就會是 0 bytes 廢檔。discord.py 的 retry 也有同樣的坑。
+    """
+    files = files or []
+
+    def _reset_files() -> None:
+        for f in files:
+            try:
+                f.reset(seek=True)
+            except Exception as e:
+                print(f'[TRANSLATE-ZIP] file.reset 失敗（已忽略）: {type(e).__name__}: {e}')
+
+    # 第一層：reply 原 interaction 訊息（slash command 的回應就是被 reply 的對象）
+    try:
+        original = await interaction.original_response()
+        await original.reply(content=content, files=files, mention_author=False)
+        return True
+    except Exception as e:
+        print(f'[TRANSLATE-ZIP] reply 原訊息失敗，改試 channel.send: '
+              f'{type(e).__name__}: {e}')
+    _reset_files()
+
+    # 第二層：直接發到頻道
+    channel = interaction.channel
+    if channel is not None:
+        try:
+            await channel.send(content=content, files=files)
+            return True
+        except Exception as e:
+            print(f'[TRANSLATE-ZIP] channel.send 失敗，改試 followup: '
+                  f'{type(e).__name__}: {e}')
+        _reset_files()
+
+    # 第三層：webhook followup（token 還活時可用）
+    try:
+        await interaction.followup.send(content=content, files=files, wait=True)
+        return True
+    except Exception as e:
+        print(f'[TRANSLATE-ZIP] followup.send 也失敗: {type(e).__name__}: {e}')
+        traceback.print_exc()
+        return False
 
 
 def setup(tree: app_commands.CommandTree) -> None:
@@ -251,11 +357,7 @@ def setup(tree: app_commands.CommandTree) -> None:
 
         await interaction.response.defer()
 
-        notice = await interaction.followup.send(
-            f'小龍喵正在翻譯圖片喵...',
-            wait=True,
-        )
-        started = time.monotonic()
+        await interaction.followup.send('小龍喵正在翻譯圖片喵...')
 
         async with aiohttp.ClientSession() as session:
             async def _one(idx: int, att: discord.Attachment, mime: str):
@@ -274,42 +376,16 @@ def setup(tree: app_commands.CommandTree) -> None:
             )
 
         files: list[discord.File] = []
-        errors: list[str] = []
         for idx, name, out, err in results:
             if err is not None:
-                errors.append(f'第 {idx} 張（{name}）：{err}')
+                print(f'[TRANSLATE] 第 {idx} 張（{name}）失敗: {err}')
                 continue
             files.append(discord.File(io.BytesIO(out), filename=f'translated_{idx}.png'))
 
-        elapsed = time.monotonic() - started
-        # over_deadline 用 interaction.created_at 算（Discord token 15min 過期、按訊息發送瞬間起算）
-        interaction_age = (datetime.now(timezone.utc) - interaction.created_at).total_seconds()
-        over_deadline = interaction_age > _EDIT_DEADLINE
-
-        lines: list[str] = []
-        head = '小龍喵幫你翻譯好了喵！' if files else '翻譯全部失敗喵...'
-        if over_deadline:
-            head += ' (本次翻譯時長超過12分鐘，避免舊訊息無法編輯已使用新messge)'
-        lines.append(head)
-        if skipped:
-            lines.append(f'跳過非圖片檔：{", ".join(skipped)}')
-        if errors:
-            lines.append('失敗：\n' + '\n'.join(errors))
-        content = '\n'.join(lines)
-
-        # 超過 12 分鐘就直接發新訊息——followup token 已經接近／超過 15 分鐘上限，
-        # edit 多半會 401。channel.send 不依賴 interaction token，可以一直發。
-        if over_deadline:
-            print(f'[TRANSLATE] 翻譯耗時 {elapsed:.0f}s 超過 {_EDIT_DEADLINE:.0f}s，改發新訊息')
-            await interaction.channel.send(content=content, files=files)
-            return
-
-        try:
-            await notice.edit(content=content, attachments=files)
-        except Exception as e:
-            print(f'[TRANSLATE] 編輯通知失敗、改用 channel.send: {type(e).__name__}: {e}')
-            traceback.print_exc()
-            await interaction.channel.send(content=content, files=files)
+        content = '翻譯完成了喵!' if files else '翻譯失敗了喵...'
+        ok = await _safe_reply(interaction, content, files=files)
+        if not ok:
+            print(f'[TRANSLATE] 圖片路線送訊息失敗（已 log）')
 
 
 async def _handle_zip_flow(
@@ -334,7 +410,7 @@ async def _handle_zip_flow(
     except Exception as e:
         print(f'[TRANSLATE-ZIP] 下載失敗: {type(e).__name__}: {e}')
         traceback.print_exc()
-        await notice.edit(content=f'下載失敗喵: {type(e).__name__}: {e}')
+        await _safe_edit(notice, f'下載失敗喵: {type(e).__name__}: {e}')
         return
 
     # 解壓挑圖（同步邏輯放 thread）；依附檔名分派 zip/rar
@@ -343,32 +419,36 @@ async def _handle_zip_flow(
             _extract_images_from_archive, zip_bytes, zip_att.filename,
         )
     except ValueError as e:
-        await notice.edit(content=f'{e}')
+        await _safe_edit(notice, f'{e}')
         return
     except Exception as e:
         print(f'[TRANSLATE-ZIP] 解壓異常: {type(e).__name__}: {e}')
         traceback.print_exc()
-        await notice.edit(content=f'解壓失敗喵: {type(e).__name__}: {e}')
+        await _safe_edit(notice, f'解壓失敗喵: {type(e).__name__}: {e}')
         return
 
     total = len(images)
     if total == 0:
-        await notice.edit(content='壓縮檔內沒有任何圖片喵（支援 png/jpg/webp/gif/bmp）')
+        await _safe_edit(notice, '壓縮檔內沒有任何圖片喵（支援 png/jpg/webp/gif/bmp）')
         return
 
-    await notice.edit(content=f'解壓完成 {total} 張，開始翻譯（一張約20秒）喵...')
+    await _safe_edit(notice, f'解壓完成 {total} 張，開始翻譯（一張約20秒）喵...')
     started = time.monotonic()
     done = 0
     fail = 0
     progress_lock = asyncio.Lock()
 
-    async def _one(idx: int, name: str, data: bytes, mime: str):
+    async def _one(idx: int, name: str, data: bytes, mime: str, label: str = ''):
         nonlocal done, fail
         try:
             out = await translate_image(data, mime, target_lang)
+            # server 偶爾回傳空 bytes（worker 中途斷掉、stream 斷線）→ 視為失敗，
+            # 否則會被打包成 0 bytes entry，整包 zip 變成廢檔
+            if not out:
+                raise RuntimeError('server 回傳空 bytes')
             result = (idx, name, out, None)
         except Exception as e:
-            print(f'[TRANSLATE-ZIP] {name} 失敗: {type(e).__name__}: {e}')
+            print(f'[TRANSLATE-ZIP] {label}{name} 失敗: {type(e).__name__}: {e}')
             traceback.print_exc()
             result = (idx, name, None, f'{type(e).__name__}: {e}')
         async with progress_lock:
@@ -385,59 +465,74 @@ async def _handle_zip_flow(
                 eta_str = f'、預估還剩 {eta:.0f}s'
             fail_str = f'（失敗 {fail}）' if fail else ''
             print(f'[TRANSLATE-ZIP] 進度 {finished}/{total}{fail_str}'
-                  f' 已耗時 {elapsed:.0f}s{eta_str} ← {name}')
+                  f' 已耗時 {elapsed:.0f}s{eta_str} ← {label}{name}')
         return result
 
-    results = await asyncio.gather(
+    # 第一輪：全部翻譯
+    results = list(await asyncio.gather(
         *(_one(i, n, d, m) for i, (n, d, m) in enumerate(images, 1))
-    )
+    ))
+
+    # 第二輪：失敗的抓出來重翻一次。單張 180s timeout，失敗多半是 Google 503 storm 那一刻
+    # 卡住，過幾秒重試多半能過。仍失敗就放棄那張。
+    failed_positions = [pos for pos, r in enumerate(results) if r[2] is None]
+    if failed_positions:
+        print(f'[TRANSLATE-ZIP] 第一輪完成 {done}/{total}，'
+              f'{len(failed_positions)} 張失敗，重試中...')
+
+        # 重置 counter：第二輪 retry 進度顯示獨立，否則 done/fail 會疊加成 99/98 之類
+        # 第一輪這些 image 已經算 fail 一次；retry 成功時 _one 會 done+=1 但原本的 fail 沒抵消
+        done = total - len(failed_positions)  # 第一輪確定成功的張數
+        fail = 0  # retry 階段重新計，仍失敗才再 +1
+
+        retry_tasks = []
+        for pos in failed_positions:
+            name_, data_, mime_ = images[pos]
+            orig_idx = results[pos][0]  # 保留原 idx 供 _build_output_zip 對位置
+            retry_tasks.append(_one(orig_idx, name_, data_, mime_, label='[retry] '))
+        retry_results = await asyncio.gather(*retry_tasks)
+
+        # 成功的 retry 覆寫回 results；失敗的留原本的錯誤訊息
+        for pos, r in zip(failed_positions, retry_results):
+            if r[2] is not None:
+                results[pos] = r
 
     # 打包輸出 zip（同步壓縮放 thread）
-    out_zip_bytes = await asyncio.to_thread(_build_output_zip, results)
+    out_zip_bytes, written = await asyncio.to_thread(_build_output_zip, results)
     out_size_mb = len(out_zip_bytes) / 1024 / 1024
 
-    success = sum(1 for _, _, out, _ in results if out is not None)
-    errors = [(name, err) for _, name, _, err in results if err is not None]
+    success = sum(1 for _, _, out, _ in results if out)
     elapsed = time.monotonic() - started
+    print(f'[TRANSLATE-ZIP] 翻譯完成 {success}/{total} 張（zip 寫入 {written} 個 entry），'
+          f'耗時 {elapsed:.0f}s，輸出 zip {out_size_mb:.2f}MB ({len(out_zip_bytes)} bytes)')
+    for _, name, _, err in results:
+        if err is not None:
+            print(f'[TRANSLATE-ZIP]   失敗: {name}: {err[:120]}')
 
-    msg_lines = [f'翻譯完成 {success}/{total} 張，耗時 {elapsed:.0f}s（輸出 zip {out_size_mb:.1f}MB）']
-    if errors:
-        head_n = min(3, len(errors))
-        err_lines = '\n'.join(f'  • {n}: {e[:80]}' for n, e in errors[:head_n])
-        msg_lines.append(f'失敗 {len(errors)}：\n{err_lines}')
-        if len(errors) > head_n:
-            msg_lines.append(f'  ...另 {len(errors) - head_n} 個失敗未列出')
-    content = '\n'.join(msg_lines)
-
-    # 超過 25MB 連 Discord 都傳不上去
-    if out_size_mb > _DISCORD_FILE_LIMIT_MB:
-        await notice.edit(content=(
-            f'{content}\n'
-            f'⚠️ 輸出 zip {out_size_mb:.1f}MB 超過 Discord 預設上限 {_DISCORD_FILE_LIMIT_MB}MB，'
-            f'伺服器升 Boost L2/L3 才能傳，或減少張數重試喵。'
-        ))
-        return
-
-    if success == 0:
-        # 沒成功的就不傳 zip 了，傳了也是空檔
-        await notice.edit(content=content)
+    # Sanity check：zip 沒任何有效 entry 就視為失敗，避免送出空 zip 給用戶
+    if written == 0:
+        await _safe_reply(interaction, '翻譯失敗了喵...')
         return
 
     out_filename = (os.path.splitext(zip_att.filename)[0] or 'manga') + '_translated.zip'
-    file = discord.File(io.BytesIO(out_zip_bytes), filename=out_filename)
-    # over_deadline 用 interaction.created_at 算（Discord token 15min 過期、按訊息發送瞬間起算）
-    interaction_age = (datetime.now(timezone.utc) - interaction.created_at).total_seconds()
-    over_deadline = interaction_age > _EDIT_DEADLINE
+    limit_mb = _get_file_limit_mb(interaction)
 
-    if over_deadline:
-        print(f'[TRANSLATE-ZIP] interaction 已 {interaction_age:.0f}s（>{_EDIT_DEADLINE:.0f}s），改發新訊息')
-        await interaction.channel.send(content='翻譯完成了喵!', files=[file])
+    # size 在 channel 上限內 → 試送 Discord；413（或其他失敗）自動 fallback litterbox
+    if out_size_mb <= limit_mb:
+        file = discord.File(io.BytesIO(out_zip_bytes), filename=out_filename)
+        if await _safe_reply(interaction, '翻譯完成了喵!', files=[file]):
+            return
+        print(f'[TRANSLATE-ZIP] Discord 上傳失敗（可能 413 / 權限），'
+              f'改 litterbox（zip {out_size_mb:.1f}MB，channel 上限 {limit_mb:.1f}MB）')
+    else:
+        print(f'[TRANSLATE-ZIP] zip {out_size_mb:.1f}MB > channel 上限 {limit_mb:.1f}MB，'
+              f'改上傳 litterbox')
+
+    # litterbox 路徑：超過上限或 Discord 直接拒
+    url = await _upload_to_litterbox(out_zip_bytes, out_filename)
+    if url is None:
+        await _safe_reply(interaction,
+                          f'翻譯完成了喵! ⚠️ zip {out_size_mb:.1f}MB Discord 塞不下，'
+                          f'litterbox 上傳也失敗了喵。')
         return
-
-    try:
-        await notice.edit(content=content, attachments=[file])
-    except Exception as e:
-        print(f'[TRANSLATE-ZIP] 編輯失敗、改用 channel.send: {type(e).__name__}: {e}')
-        traceback.print_exc()
-        # interaction 過期才走到這 → 用簡短新訊息，stats 已在 log
-        await interaction.channel.send(content='翻譯完成了喵!', files=[file])
+    await _safe_reply(interaction, f'翻譯完成了喵!\n{url}')

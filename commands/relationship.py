@@ -1,18 +1,16 @@
 """
-/relationship：所有關係互動單一指令（除 /抽今日媽媽 外）。
+/relationship：所有關係互動單一指令（除 /抽今日媽媽、/電擊蘿莉控 外）。
 
 用法：/relationship 選項:<功能> [用戶] [用戶b]
 
 選項：
     認養寵物 / 認主人 / 放生寵物 / 本群關係圖
     認媽媽 / 拋棄兒子 / 和今日媽媽斷絕關係
-    電子皮鞭 / 解除調教 / 炮決蘿莉控
+    電子皮鞭 / 解除調教
 """
 from __future__ import annotations
 
-import asyncio
 import os
-import random
 from datetime import datetime, timezone, timedelta
 from typing import Literal
 
@@ -29,9 +27,7 @@ _REL_FILE       = os.path.join('data', 'relationships.json')
 _WIFE_FILE      = os.path.join('data', 'wife_records.json')
 _WHIP_FILE      = os.path.join('data', 'whip_records.json')
 _WHIP_REL_FILE  = os.path.join('data', 'whip_relations.json')
-_ARTILLERY_FILE = os.path.join('data', 'artillery_records.json')
 _WHIP_IMG       = os.path.join('picture', 'whip.png')
-_ARTILLERY_IMG  = os.path.join('picture', 'artillerylolicon.jpg')
 
 _LOVE_EMOJI  = '<:klllove:1486300373068152832>'
 _CRY_EMOJI   = '<:crycat:1486308949173997730>'
@@ -214,7 +210,8 @@ async def _handle_adopt(interaction: discord.Interaction, target: discord.Member
     embed = discord.Embed(
         title='認養邀請',
         description=(
-            f'{target.mention}，**{interaction.user.display_name}** '
+            f'**{target.display_name}**\n({target.mention})\n'
+            f'**{interaction.user.display_name}** '
             f'想認養你為寵物，你願意嗎？'
         ),
         color=discord.Color.fuchsia(),
@@ -233,7 +230,8 @@ async def _handle_find_master(interaction: discord.Interaction, target: discord.
     embed = discord.Embed(
         title='主人邀請',
         description=(
-            f'{target.mention}，**{interaction.user.display_name}** '
+            f'**{target.display_name}**\n({target.mention})\n'
+            f'**{interaction.user.display_name}** '
             f'想認你為主人，你願意嗎？'
         ),
         color=discord.Color.fuchsia(),
@@ -381,8 +379,8 @@ async def _handle_whip(interaction: discord.Interaction,
     embed = discord.Embed(
         title='電子皮鞭邀請',
         description=(
-            f'{trainee.mention}，你願意被 '
-            f'**{trainer.display_name}** 調教嗎？'
+            f'**{trainee.display_name}**\n({trainee.mention})\n'
+            f'你願意被 **{trainer.display_name}** 調教嗎？'
         ),
         color=discord.Color.dark_red(),
     )
@@ -414,81 +412,20 @@ async def _handle_whip_clear(interaction: discord.Interaction, target: discord.M
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-async def _handle_artillery(interaction: discord.Interaction,
-                            target: discord.Member | None):
-    guild   = interaction.guild
-    channel = interaction.channel
-    if guild is None or channel is None:
-        await _send_error(interaction, '此指令只能在伺服器中使用')
-        return
-
-    if target is not None:
-        victim = target
-    else:
-        await interaction.response.defer()
-        if not guild.chunked:
-            try:
-                await asyncio.wait_for(guild.chunk(), timeout=5.0)
-            except asyncio.TimeoutError:
-                pass
-        if isinstance(channel, discord.TextChannel):
-            members = [m for m in guild.members
-                       if not m.bot and channel.permissions_for(m).view_channel]
-        else:
-            members = [m for m in guild.members if not m.bot]
-        if not members:
-            await interaction.followup.send(
-                embed=discord.Embed(description='找不到可砲擊的對象', color=discord.Color.red()),
-                ephemeral=True,
-            )
-            return
-        victim = random.choice(members)
-        fresh = guild.get_member(victim.id)
-        if fresh is None:
-            try:
-                fresh = await guild.fetch_member(victim.id)
-            except discord.HTTPException:
-                fresh = None
-        if fresh is not None:
-            victim = fresh
-
-    uid = str(victim.id)
-    gid = str(guild.id)
-    records = load_json(_ARTILLERY_FILE)
-    records.setdefault(gid, {})[uid] = records.get(gid, {}).get(uid, 0) + 1
-    count = records[gid][uid]
-    save_json(_ARTILLERY_FILE, records)
-
-    embed = discord.Embed(
-        title='炮決蘿莉控',
-        description=f'今天要炮決的蘿莉控是 {victim.mention}',
-        color=discord.Color.dark_red(),
-    )
-    embed.add_field(name='累計被炮決', value=f'{count} 次')
-    send = (interaction.followup.send if interaction.response.is_done()
-            else interaction.response.send_message)
-    if os.path.exists(_ARTILLERY_IMG):
-        embed.set_image(url='attachment://artillerylolicon.jpg')
-        await send(embed=embed, file=discord.File(_ARTILLERY_IMG,
-                                                   filename='artillerylolicon.jpg'))
-    else:
-        await send(embed=embed)
-
-
 # ─── 指令註冊 ───────────────────────────────────────────────────
 _RelOption = Literal[
     '認養寵物', '認主人', '放生寵物', '本群關係圖',
     '認媽媽', '拋棄兒子', '和今日媽媽斷絕關係',
-    '電子皮鞭', '解除調教', '炮決蘿莉控',
+    '電子皮鞭', '解除調教',
 ]
 
 
 def setup(tree: app_commands.CommandTree) -> None:
 
-    @tree.command(name='relationship', description='主寵 / 媽媽 / 調教 / 炮決 等關係互動')
+    @tree.command(name='relationship', description='主寵 / 媽媽 / 調教 等關係互動')
     @app_commands.describe(
         選項='要執行的功能',
-        用戶='指定對象（多數選項需要；炮決可不填走隨機）',
+        用戶='指定對象（多數選項需要）',
         用戶b='電子皮鞭：填此項時用戶為調教者、用戶b為被調教者',
     )
     async def slash_rel(
@@ -503,9 +440,6 @@ def setup(tree: app_commands.CommandTree) -> None:
             return
         if 選項 == '和今日媽媽斷絕關係':
             await _handle_divorce(interaction)
-            return
-        if 選項 == '炮決蘿莉控':
-            await _handle_artillery(interaction, 用戶)
             return
 
         # ── 需要 用戶 的選項 ───────────────────────────────────

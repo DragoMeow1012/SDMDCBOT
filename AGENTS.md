@@ -75,16 +75,24 @@ Discord lag, data corruption, or rate-limiting.
 | File | Written by | Read by | Notes |
 |---|---|---|---|
 | `data/chat_history.json` | [history.py](history.py) | `load_history()` on startup | Atomic write + async save in hot path |
-| `data/summaries/{cid}.txt` | [summary.py](summary.py) | Injected into model system prompt | Trimmed to `MAX_LINES` × `MAX_CHARS` |
-| `data/nicknames.json` | [nicknames.py](nicknames.py) | `state.nicknames` | Atomic |
-| `data/knowledge.json` | [knowledge.py](knowledge.py) | `state.knowledge_entries` | Atomic |
-| `data/merit.json` | [commands/fun.py](commands/fun.py) | fun.py | 電子木魚 功德 |
-| `data/relationships.json` | [commands/social.py](commands/social.py) | social.py + graph_render | 主寵關係 |
-| `data/wife_records.json` | [commands/wife.py](commands/wife.py) | wife.py + graph_render | 當日媽媽，跨日自動清除 |
-| `data/artillery_records.json` | [commands/artillery.py](commands/artillery.py) | artillery.py | |
+| `data/summaries/{cid}.txt` | [summary.py](summary.py) | Injected into model system prompt | Trimmed to `MAX_LINES` × `MAX_CHARS` (atomic TXT write) |
+| `data/merit.json` | [commands/tool.py](commands/tool.py) (電子木魚) | [commands/rank.py](commands/rank.py) | 功德排行 |
+| `data/relationships.json` | [commands/relationship.py](commands/relationship.py) | relationship.py + [graph_render.py](graph_render.py) | 主寵關係 |
+| `data/wife_records.json` | [commands/daily_mom.py](commands/daily_mom.py), [commands/relationship.py](commands/relationship.py) | daily_mom + relationship + graph_render | 當日媽媽，跨日自動清除 |
+| `data/whip_records.json` | [commands/relationship.py](commands/relationship.py) | rank.py | 調教次數排行 |
+| `data/whip_relations.json` | [commands/relationship.py](commands/relationship.py) | relationship.py + graph_render | 調教關係（trainer→trainee） |
+| `data/artillery_records.json` | [commands/relationship.py](commands/relationship.py) | rank.py | 炮決排行 |
+| `data/logs/bot_YYYY-MM-DD.log` | [logger.py](logger.py) | tail | 依日期切檔 |
+| `data/logs/manga_translator_server.log` | [manga_translator_server.py](manga_translator_server.py) | tail | >50MB 自動滾動 .old |
 | `pixivdata/data/pixiv.db` | [pixiv_database.py](pixiv_database.py) | crawler + search | SQLite, thread-local conn |
 | `pixivdata/data/feature.index` | [pixiv_feature.py](pixiv_feature.py) | reverse-search + dedup | FAISS binary index |
 | `pixivdata/data/*_progress.json` | crawler | crawler | Resume checkpoints |
+
+**Removed modules** — these were referenced in older docs but no longer exist: `nicknames.py`,
+`knowledge.py`, `commands/fun.py`, `commands/social.py`, `commands/wife.py`, `commands/whip.py`,
+`commands/gag.py`, `commands/artillery.py`, `commands/nick.py`, `commands/kb.py`, `commands/search.py`.
+Functions either folded into `commands/tool.py` / `commands/relationship.py` / `commands/rank.py` /
+`commands/daily_mom.py` / `commands/image_search.py`, or removed entirely.
 
 **`state.py` is the only blessed mutable-global module.** Do not add new globals in random
 places; put shared mutable state there.
