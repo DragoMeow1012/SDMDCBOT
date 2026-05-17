@@ -19,6 +19,7 @@ from commands import (
     electrocute,
     morning,
     gamble,
+    stock,
 )
 
 
@@ -37,3 +38,4 @@ def setup_all(tree: app_commands.CommandTree) -> None:
     electrocute.setup(tree)
     morning.setup(tree)
     gamble.setup(tree)
+    stock.setup(tree)
