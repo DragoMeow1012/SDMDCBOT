@@ -49,41 +49,86 @@ def _roll_3d6() -> tuple[int, int, int]:
 def _result_embed(init_user: discord.abc.User, opp_user: discord.abc.User,
                   bet: int, game_name: str,
                   init_show: str, opp_show: str,
-                  winner: discord.abc.User | None) -> discord.Embed:
+                  winner: discord.abc.User | None,
+                  mult: float = 1.0,
+                  init_balance: int | None = None,
+                  opp_balance: int | None = None) -> discord.Embed:
     if winner is None:
         title = f'🤝 PVP {game_name} — 平手'
-        body  = f'雙方各退回 {bet} 咕嚕喵碎片'
+        body  = f'雙方各退回 {bet} 咕嚕喵碎片（不套用倍率）'
         color = discord.Color.gold()
     else:
         loser = opp_user if winner.id == init_user.id else init_user
+        transfer = int(bet * mult)
         title = f'🏆 PVP {game_name} — {winner.display_name} 勝'
         body  = (
-            f'{winner.mention} 贏得 **{bet * 2}** 咕嚕喵碎片（淨 +{bet}）\n'
-            f'{loser.mention} 失去 **{bet}**'
+            f'最高倍率 **{mult:.2f}x** × 本注 **{bet}** = **{transfer}** 咕嚕喵碎片\n'
+            f'{winner.mention} 淨 **+{transfer}**\n'
+            f'{loser.mention} 淨 **-{transfer}**'
         )
         color = discord.Color.green()
 
     embed = discord.Embed(title=title, description=body, color=color)
-    embed.add_field(name=f'⚔️ {init_user.display_name}', value=init_show, inline=True)
-    embed.add_field(name=f'🛡️ {opp_user.display_name}',  value=opp_show,  inline=True)
+    embed.add_field(name=f'⚔️ {init_user.display_name}',
+                    value=init_show, inline=True)
+    embed.add_field(name=f'🛡️ {opp_user.display_name}',
+                    value=opp_show,  inline=True)
+    if init_balance is not None and opp_balance is not None:
+        embed.add_field(
+            name='💰 結算後餘額',
+            value=(
+                f'{init_user.mention}: **{init_balance}** 咕嚕喵碎片\n'
+                f'{opp_user.mention}: **{opp_balance}** 咕嚕喵碎片'
+            ),
+            inline=False,
+        )
     return embed
 
 
+# 每個遊戲類型的「最高倍率」(net win = bet × N) 用於 PVP 結算
+# crash / mines 用 winner 實際達到的 cashout 倍率（動態），其他用此表
+_PVP_STATIC_MULT = {
+    'card':     2,    # 比大小
+    'dice':     5,    # 骰子比大小
+    'slot':     5,    # 老虎機比大小
+    'roulette': 5,    # 輪盤比大小
+    'bj':       5,    # 21 點
+    # 'crash' / 'mines' 用實際倍率（_compute_pvp_mult 內處理）
+}
+
+
+def _compute_pvp_mult(game_type: str, init_val: float, opp_val: float) -> float:
+    """回傳本局 PVP 結算時的「最高倍率」。crash/mines 走實際 cashout，
+    其他遊戲用 _PVP_STATIC_MULT 中的靜態值。"""
+    if game_type in ('crash', 'mines'):
+        return max(1.0, float(max(init_val, opp_val)))
+    return float(_PVP_STATIC_MULT.get(game_type, 1))
+
+
 async def _settle(init_user: discord.abc.User, opp_user: discord.abc.User,
-                  bet: int, init_val: int, opp_val: int
-                  ) -> discord.abc.User | None:
-    """根據比較結果分配獎金。回傳 winner 或 None（平手）。
-    本注於開局時已雙方各扣；這裡只負責把獎金回填。"""
+                  bet: int, init_val: float, opp_val: float,
+                  game_type: str = 'card',
+                  ) -> tuple[discord.abc.User | None, float]:
+    """根據比較結果分配獎金。回傳 (winner|None, 倍率)。
+    本注於開局時已雙方各扣。輸贏轉移額 = bet × 最高倍率（可使輸家負債）。"""
+    mult = _compute_pvp_mult(game_type, init_val, opp_val)
+    if init_val == opp_val:
+        # 平手：退本，不套用倍率
+        await apply_delta(str(init_user.id), bet)
+        await apply_delta(str(opp_user.id),  bet)
+        return None, mult
+    transfer = int(bet * mult)
     if init_val > opp_val:
-        await apply_delta(str(init_user.id), bet * 2)  # 拿回本注 + 對手本注
-        return init_user
-    if opp_val > init_val:
-        await apply_delta(str(opp_user.id),  bet * 2)
-        return opp_user
-    # 平手：退本
-    await apply_delta(str(init_user.id), bet)
-    await apply_delta(str(opp_user.id),  bet)
-    return None
+        winner, loser = init_user, opp_user
+    else:
+        winner, loser = opp_user, init_user
+    # 贏家：退本 + 收取對手 transfer 額
+    await apply_delta(str(winner.id), bet + transfer)
+    # 輸家：除了開局已扣的 bet，再額外扣 (transfer - bet)；可能造成負餘額
+    extra_loss = transfer - bet
+    if extra_loss != 0:
+        await apply_delta(str(loser.id), -extra_loss)
+    return winner, mult
 
 
 # ── 瞬間結算的 PVP（card/dice/slot/roulette）共用私密 session ──────
@@ -163,12 +208,17 @@ class _InstantPVPSession:
         self.settled = True
         init_s = self.scores[self.init_user.id]
         opp_s  = self.scores[self.opp_user.id]
-        winner = await _settle(self.init_user, self.opp_user, self.bet,
-                               init_s, opp_s)
+        winner, mult = await _settle(
+            self.init_user, self.opp_user, self.bet,
+            init_s, opp_s, game_type=self.GAME_TYPE,
+        )
+        init_bal = get_balance(str(self.init_user.id))
+        opp_bal  = get_balance(str(self.opp_user.id))
         embed = _result_embed(
             self.init_user, self.opp_user, self.bet, self.GAME_NAME,
             self.shows[self.init_user.id], self.shows[self.opp_user.id],
-            winner,
+            winner, mult=mult,
+            init_balance=init_bal, opp_balance=opp_bal,
         )
         try:
             await self.public_msg.edit(
@@ -322,18 +372,6 @@ async def _play_compare_roulette(interaction: discord.Interaction,
 # 兩邊都結束 → 自動結算 + 退回 EndOfGameView 樣式（不再來一局）
 # ─────────────────────────────────────────────────────────────────────
 
-async def _pvp_finalize(view, init_show: str, opp_show: str,
-                        init_score: float, opp_score: float,
-                        game_name: str) -> discord.Embed:
-    """共用結算：扣本注已預扣，這裡只負責入帳 + 出 result embed。"""
-    winner = await _settle(view.init_user, view.opp_user, view.bet,
-                           init_score, opp_score)
-    return _result_embed(
-        view.init_user, view.opp_user, view.bet, game_name,
-        init_show, opp_show, winner,
-    )
-
-
 async def _smart_edit(interaction: discord.Interaction, **kwargs) -> None:
     """interaction.response 已用過 → 直接 message.edit；
     否則用 response.edit_message。讓深處 helper 不必管 defer 狀態。
@@ -355,12 +393,14 @@ async def _smart_edit(interaction: discord.Interaction, **kwargs) -> None:
 class PVPAgainView(discord.ui.View):
     """PVP 結算後的「再來一局」按鈕。雙方各一顆，都按下後直接同訊息開新一局。"""
 
-    def __init__(self, init_user, opp_user, bet: int, game_type: str):
+    def __init__(self, init_user, opp_user, bet: int, game_type: str,
+                 extra: dict | None = None):
         super().__init__(timeout=600)
         self.init_user  = init_user
         self.opp_user   = opp_user
         self.bet        = bet
         self.game_type  = game_type
+        self.extra      = extra or {}
         self.init_ready = False
         self.opp_ready  = False
         self._building  = False
@@ -427,6 +467,7 @@ class PVPAgainView(discord.ui.View):
                 await _dispatch_game(
                     interaction, self.game_type,
                     self.init_user, self.opp_user, self.bet,
+                    extra=self.extra,
                 )
             else:
                 self._build()
@@ -435,13 +476,17 @@ class PVPAgainView(discord.ui.View):
 
 
 def _again_view(init_user, opp_user, bet: int,
-                game_type: str) -> PVPAgainView:
-    return PVPAgainView(init_user, opp_user, bet, game_type)
+                game_type: str,
+                extra: dict | None = None) -> PVPAgainView:
+    return PVPAgainView(init_user, opp_user, bet, game_type, extra)
 
 
 async def _dispatch_game(interaction: discord.Interaction, game_type: str,
-                         init_user, opp_user, bet: int) -> None:
-    """根據 game_type 派遣到對應的 PVP 對局函式（雙方均已扣費）。"""
+                         init_user, opp_user, bet: int,
+                         extra: dict | None = None) -> None:
+    """根據 game_type 派遣到對應的 PVP 對局函式（雙方均已扣費）。
+    extra 用於傳遞遊戲特定設定（例如 mines 的 mine_count）。"""
+    extra = extra or {}
     if game_type == 'card':
         await _play_compare_card(interaction, init_user, opp_user, bet)
     elif game_type == 'dice':
@@ -455,7 +500,9 @@ async def _dispatch_game(interaction: discord.Interaction, game_type: str,
     elif game_type == 'crash':
         await _play_pvp_crash(interaction, init_user, opp_user, bet)
     elif game_type == 'mines':
-        await _play_pvp_minesweeper(interaction, init_user, opp_user, bet)
+        # rematch 走這條：跳過難度選擇，直接用 extra 帶的 mine_count
+        mc = int(extra.get('mine_count', 3))
+        await _start_pvp_mines(interaction, init_user, opp_user, bet, mc)
 
 
 # ── 21 點 PVP（私密手牌） ──────────────────────────────────────────
@@ -604,11 +651,16 @@ class PVP21Session:
         # 開牌組 result embed（這時候才把雙方手牌公開）
         init_show = self._format_revealed(self.init_user.id)
         opp_show  = self._format_revealed(self.opp_user.id)
-        winner = await _settle(self.init_user, self.opp_user, self.bet,
-                               init_s, opp_s)
+        winner, mult = await _settle(
+            self.init_user, self.opp_user, self.bet,
+            init_s, opp_s, game_type='bj',
+        )
+        init_bal = get_balance(str(self.init_user.id))
+        opp_bal  = get_balance(str(self.opp_user.id))
         result_embed = _result_embed(
             self.init_user, self.opp_user, self.bet, '21 點 PVP',
-            init_show, opp_show, winner,
+            init_show, opp_show, winner, mult=mult,
+            init_balance=init_bal, opp_balance=opp_bal,
         )
         # 觸發結算者的 ephemeral 收尾
         await interaction.response.edit_message(
@@ -879,12 +931,17 @@ class _PVPCrashSession:
         self.settled = True
         init_s = self.game.score(self.init_user.id)
         opp_s  = self.game.score(self.opp_user.id)
-        winner = await _settle(self.init_user, self.opp_user, self.bet,
-                               init_s, opp_s)
+        winner, mult = await _settle(
+            self.init_user, self.opp_user, self.bet,
+            init_s, opp_s, game_type='crash',
+        )
+        init_bal = get_balance(str(self.init_user.id))
+        opp_bal  = get_balance(str(self.opp_user.id))
         result = _result_embed(
             self.init_user, self.opp_user, self.bet, '爆點 PVP',
             self._reveal_str(self.init_user.id),
-            self._reveal_str(self.opp_user.id), winner,
+            self._reveal_str(self.opp_user.id), winner, mult=mult,
+            init_balance=init_bal, opp_balance=opp_bal,
         )
         await interaction.response.edit_message(
             embed=self._eph_embed(last_uid, finished=True), view=None,
@@ -985,34 +1042,34 @@ async def _play_pvp_crash(interaction: discord.Interaction,
 
 # ── 踩地雷 PVP ────────────────────────────────────────────────────────
 class PVPMinesGame:
-    """簡化版：每位玩家各自 20 格場（3 顆地雷），按「揭格」隨機掀一格。"""
+    """每位玩家各自 5×4=20 格場（地雷數可選 3/8/15），ephemeral 上手動選格揭。"""
     CELLS = 20
-    MINES_N = 3
 
-    def __init__(self, init_id: int, opp_id: int):
-        self.unrevealed = {}
-        self.mines      = {}
-        self.safe_count = {}
-        self.crashed    = {}
-        self.cashed     = {}
+    def __init__(self, init_id: int, opp_id: int, mine_count: int = 3):
+        self.mine_count = mine_count
+        self.mines    : dict[int, set[int]] = {}
+        self.revealed : dict[int, set[int]] = {}
+        self.crashed  : dict[int, bool]     = {}
+        self.cashed   : dict[int, bool]     = {}
         for uid in (init_id, opp_id):
             cells = list(range(self.CELLS))
-            self.mines[uid]      = set(random.sample(cells, self.MINES_N))
-            self.unrevealed[uid] = cells.copy()
-            self.safe_count[uid] = 0
-            self.crashed[uid]    = False
-            self.cashed[uid]     = False
+            self.mines[uid]    = set(random.sample(cells, mine_count))
+            self.revealed[uid] = set()
+            self.crashed[uid]  = False
+            self.cashed[uid]   = False
 
-    def reveal(self, uid: int) -> str:
-        if self.is_done(uid) or not self.unrevealed[uid]:
+    def reveal(self, uid: int, idx: int) -> str:
+        """揭指定格。回傳 'safe' / 'mine' / 'noop'。"""
+        if self.is_done(uid) or idx in self.revealed[uid]:
             return 'noop'
-        idx = random.choice(self.unrevealed[uid])
-        self.unrevealed[uid].remove(idx)
+        self.revealed[uid].add(idx)
         if idx in self.mines[uid]:
             self.crashed[uid] = True
             return 'mine'
-        self.safe_count[uid] += 1
         return 'safe'
+
+    def safe_count(self, uid: int) -> int:
+        return sum(1 for i in self.revealed[uid] if i not in self.mines[uid])
 
     def cash_out(self, uid: int) -> None:
         if not self.is_done(uid):
@@ -1025,20 +1082,19 @@ class PVPMinesGame:
         return all(self.is_done(uid) for uid in self.mines)
 
     def mult(self, uid: int) -> float:
-        # 借用 minesweeper 公式
-        return _m.mines_mult(self.safe_count[uid], self.MINES_N)
+        return _m.mines_mult(self.safe_count(uid), self.mine_count)
 
     def score(self, uid: int) -> float:
         return self.mult(uid) if self.cashed[uid] else 0.0
 
 
 class _PVPMinesSession:
-    def __init__(self, public_msg, init_user, opp_user, bet):
+    def __init__(self, public_msg, init_user, opp_user, bet, mine_count=3):
         self.public_msg = public_msg
         self.init_user  = init_user
         self.opp_user   = opp_user
         self.bet        = bet
-        self.game       = PVPMinesGame(init_user.id, opp_user.id)
+        self.game       = PVPMinesGame(init_user.id, opp_user.id, mine_count)
         self.joined     = {init_user.id: False, opp_user.id: False}
         self.ephemerals : dict[int, discord.Message] = {}
         self.settled    = False
@@ -1046,7 +1102,7 @@ class _PVPMinesSession:
     def _public_embed(self) -> discord.Embed:
         lines = [
             f'**踩地雷 PVP** — 各下 **{self.bet}** 咕嚕喵碎片',
-            f'地雷 {self.game.MINES_N} 顆 / 20 格隨機揭，每人自己的場只有自己看得到',
+            f'地雷 {self.game.mine_count} 顆 / 20 格手動選格揭，每人自己的場只有自己看得到',
             '',
         ]
         for u in (self.init_user, self.opp_user):
@@ -1076,7 +1132,7 @@ class _PVPMinesSession:
             pass
 
     def _eph_embed(self, uid: int, *, finished: bool = False) -> discord.Embed:
-        n    = self.game.safe_count[uid]
+        n    = self.game.safe_count(uid)
         mult = self.game.mult(uid)
         if self.game.crashed[uid]:
             return discord.Embed(
@@ -1101,7 +1157,7 @@ class _PVPMinesSession:
             description=(
                 f'已揭 {n} 安全格　|　當前倍率 **{mult:.2f}x**\n'
                 f'投注 {self.bet}　提現可得 **{int(self.bet * mult)}**\n\n'
-                '按 ❓「揭格」隨機翻一格（可能踩雷） | 按 💰「提現」鎖定'
+                '點 ❓ 揭一格 | 點 💰 提現鎖定'
             ),
             color=discord.Color.blurple(),
         )
@@ -1124,13 +1180,13 @@ class _PVPMinesSession:
         await self._update_public()
 
     async def action(self, interaction: discord.Interaction,
-                     uid: int, what: str) -> None:
+                     uid: int, what: str, idx: int | None = None) -> None:
         if self.settled:
             await interaction.response.defer()
             return
-        if what == 'reveal':
-            self.game.reveal(uid)
-        else:
+        if what == 'reveal' and idx is not None:
+            self.game.reveal(uid, idx)
+        elif what == 'cash':
             self.game.cash_out(uid)
 
         if self.game.all_done():
@@ -1142,26 +1198,50 @@ class _PVPMinesSession:
         )
         await self._update_public()
 
+    def _grid_text(self, uid: int) -> str:
+        """揭完整盤面（包含尚未揭開的）。"""
+        game = self.game
+        mines = game.mines[uid]
+        revealed = game.revealed[uid]
+        rows = []
+        for r in range(4):
+            row = []
+            for c in range(5):
+                idx = r * 5 + c
+                if idx in revealed:
+                    row.append('💥' if idx in mines else '🦺')
+                else:
+                    row.append('💣' if idx in mines else '⬜')
+            rows.append(' '.join(row))
+        return '\n'.join(rows)
+
     def _reveal_str(self, uid: int) -> str:
-        n    = self.game.safe_count[uid]
+        n    = self.game.safe_count(uid)
         mult = self.game.mult(uid)
         if self.game.crashed[uid]:
-            return f'💥 BOOM（{n} 安全格 → 0x）'
-        if self.game.cashed[uid]:
-            return f'💰 提現 @ **{mult:.2f}x**（{n} 安全格）'
-        return '—'
+            head = f'💥 BOOM（{n} 安全格 → 0x）'
+        elif self.game.cashed[uid]:
+            head = f'💰 提現 @ **{mult:.2f}x**（{n} 安全格）'
+        else:
+            head = '—'
+        return f'{head}\n{self._grid_text(uid)}'
 
     async def _finalize(self, interaction: discord.Interaction,
                         last_uid: int) -> None:
         self.settled = True
         init_s = self.game.score(self.init_user.id)
         opp_s  = self.game.score(self.opp_user.id)
-        winner = await _settle(self.init_user, self.opp_user, self.bet,
-                               init_s, opp_s)
+        winner, mult = await _settle(
+            self.init_user, self.opp_user, self.bet,
+            init_s, opp_s, game_type='mines',
+        )
+        init_bal = get_balance(str(self.init_user.id))
+        opp_bal  = get_balance(str(self.opp_user.id))
         result = _result_embed(
             self.init_user, self.opp_user, self.bet, '踩地雷 PVP',
             self._reveal_str(self.init_user.id),
-            self._reveal_str(self.opp_user.id), winner,
+            self._reveal_str(self.opp_user.id), winner, mult=mult,
+            init_balance=init_bal, opp_balance=opp_bal,
         )
         await interaction.response.edit_message(
             embed=self._eph_embed(last_uid, finished=True), view=None,
@@ -1180,7 +1260,10 @@ class _PVPMinesSession:
         try:
             await self.public_msg.edit(
                 embed=result,
-                view=_again_view(self.init_user, self.opp_user, self.bet, 'mines'),
+                view=_again_view(
+                    self.init_user, self.opp_user, self.bet, 'mines',
+                    extra={'mine_count': self.game.mine_count},
+                ),
             )
         except discord.HTTPException:
             pass
@@ -1218,6 +1301,8 @@ class _PVPMinesPublicView(discord.ui.View):
 
 
 class _PVPMinesEphView(discord.ui.View):
+    """私訊：5×4 = 20 個格子（row 0~3）+ 第 5 列 1 顆 💰 提現。"""
+
     def __init__(self, session: _PVPMinesSession, owner_id: int):
         super().__init__(timeout=900)
         self.session  = session
@@ -1226,38 +1311,125 @@ class _PVPMinesEphView(discord.ui.View):
 
     def _build(self) -> None:
         self.clear_items()
-        done = self.session.game.is_done(self.owner_id)
-        rev = discord.ui.Button(
-            label='揭格', emoji='❓',
-            style=discord.ButtonStyle.primary, disabled=done,
-        )
-        rev.callback = self._cb('reveal')
-        self.add_item(rev)
+        game = self.session.game
+        done = game.is_done(self.owner_id)
+        revealed = game.revealed[self.owner_id]
+        mines    = game.mines[self.owner_id]
+        for idx in range(PVPMinesGame.CELLS):
+            row = idx // 5
+            if idx in revealed:
+                if idx in mines:
+                    btn = discord.ui.Button(
+                        emoji='💥', style=discord.ButtonStyle.danger,
+                        row=row, disabled=True,
+                    )
+                else:
+                    btn = discord.ui.Button(
+                        emoji='🦺', style=discord.ButtonStyle.success,
+                        row=row, disabled=True,
+                    )
+            else:
+                btn = discord.ui.Button(
+                    emoji='❓', style=discord.ButtonStyle.secondary,
+                    row=row, disabled=done,
+                )
+                btn.callback = self._reveal_cb(idx)
+            self.add_item(btn)
+        # row 4：提現
         cash = discord.ui.Button(
             label='提現', emoji='💰',
-            style=discord.ButtonStyle.success, disabled=done,
+            style=discord.ButtonStyle.success,
+            row=4, disabled=done,
         )
-        cash.callback = self._cb('cash')
+        cash.callback = self._cash_cb()
         self.add_item(cash)
 
-    def _cb(self, action: str):
+    def _reveal_cb(self, idx: int):
         async def _do(interaction: discord.Interaction) -> None:
             if interaction.user.id != self.owner_id:
                 await interaction.response.send_message(
                     '這不是你的場', ephemeral=True,
                 )
                 return
-            await self.session.action(interaction, self.owner_id, action)
+            await self.session.action(
+                interaction, self.owner_id, 'reveal', idx,
+            )
+        return _do
+
+    def _cash_cb(self):
+        async def _do(interaction: discord.Interaction) -> None:
+            if interaction.user.id != self.owner_id:
+                await interaction.response.send_message(
+                    '這不是你的場', ephemeral=True,
+                )
+                return
+            await self.session.action(
+                interaction, self.owner_id, 'cash',
+            )
         return _do
 
 
-async def _play_pvp_minesweeper(interaction: discord.Interaction,
-                                init_user, opp_user, bet: int) -> None:
-    session = _PVPMinesSession(interaction.message, init_user, opp_user, bet)
+_PVP_MINES_DIFFICULTIES = (3, 8, 15)
+
+
+class _PVPMinesDifficultyView(discord.ui.View):
+    """對手選擇地雷數（3/8/15）後才正式開局。"""
+
+    def __init__(self, init_user, opp_user, bet: int):
+        super().__init__(timeout=300)
+        self.init_user = init_user
+        self.opp_user  = opp_user
+        self.bet       = bet
+        for n in _PVP_MINES_DIFFICULTIES:
+            btn = discord.ui.Button(
+                label=f'{n} 顆地雷', emoji='💣',
+                style=discord.ButtonStyle.primary,
+            )
+            btn.callback = self._cb(n)
+            self.add_item(btn)
+
+    def _cb(self, mine_count: int):
+        async def _do(interaction: discord.Interaction) -> None:
+            if interaction.user.id != self.init_user.id:
+                await interaction.response.send_message(
+                    '由發起者選擇地雷數', ephemeral=True,
+                )
+                return
+            await _start_pvp_mines(
+                interaction, self.init_user, self.opp_user,
+                self.bet, mine_count,
+            )
+            self.stop()
+        return _do
+
+
+async def _start_pvp_mines(interaction: discord.Interaction,
+                           init_user, opp_user, bet: int,
+                           mine_count: int) -> None:
+    """正式開 PVP 踩地雷局（不再顯示難度選擇）。"""
+    session = _PVPMinesSession(
+        interaction.message, init_user, opp_user, bet, mine_count,
+    )
     await _smart_edit(
         interaction, content=None, embed=session._public_embed(),
         view=_PVPMinesPublicView(session),
     )
+
+
+async def _play_pvp_minesweeper(interaction: discord.Interaction,
+                                init_user, opp_user, bet: int) -> None:
+    """對手點「踩地雷」後跳到難度選擇頁。"""
+    embed = discord.Embed(
+        title='💣 踩地雷 PVP — 選擇難度',
+        description=(
+            f'**對戰**：{init_user.mention} vs {opp_user.mention}\n'
+            f'下注：**{bet}** 咕嚕喵碎片（雙方已扣）\n\n'
+            f'{init_user.mention}（發起者）請選擇本局地雷數量：'
+        ),
+        color=discord.Color.blurple(),
+    )
+    view = _PVPMinesDifficultyView(init_user, opp_user, bet)
+    await _smart_edit(interaction, content=None, embed=embed, view=view)
 
 
 class PVPInviteView(discord.ui.View):
