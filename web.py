@@ -13,6 +13,20 @@ _TIMEOUT = aiohttp.ClientTimeout(total=20, connect=5)
 
 _ELEMENTS = ('p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'a', 'span')
 
+# Module-level shared session：避免每次 fetch_url 都做 TCP/TLS 握手。
+# Connection pool 也讓打同個 host 多次時直接重用連線。
+_session: aiohttp.ClientSession | None = None
+_session_lock = asyncio.Lock()
+
+
+async def _get_session() -> aiohttp.ClientSession:
+    global _session
+    if _session is None or _session.closed:
+        async with _session_lock:
+            if _session is None or _session.closed:
+                _session = aiohttp.ClientSession(timeout=_TIMEOUT, headers=_HEADERS)
+    return _session
+
 
 def _parse(html: str) -> str:
     soup = BeautifulSoup(html, 'html.parser')
@@ -31,10 +45,10 @@ async def fetch_url(url: str) -> str:
         return '錯誤: 不支援抓取此網站'
 
     try:
-        async with aiohttp.ClientSession(timeout=_TIMEOUT, headers=_HEADERS) as session:
-            async with session.get(url) as resp:
-                resp.raise_for_status()
-                html = await resp.text()
+        session = await _get_session()
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            html = await resp.text()
 
         # HTML 解析交給 thread pool，避免阻塞 event loop
         return await asyncio.to_thread(_parse, html)

@@ -1678,11 +1678,9 @@ class PVPSetupView(discord.ui.View):
             )
             self.stop()
             return
-        # disable setup，再公開送出邀請
-        for c in self.children:
-            if isinstance(c, (discord.ui.Button, discord.ui.Select)):
-                c.disabled = True
-        await interaction.response.edit_message(view=self)
+        # 收掉 ephemeral 設定畫面，再公開送出邀請
+        await interaction.response.defer()
+        await interaction.delete_original_response()
         self.stop()
         await _send_invite(interaction, self.opponent, self.bet)
 

@@ -416,10 +416,8 @@ class MinesSetupView(discord.ui.View):
             )
             self.stop()
             return
-        for c in self.children:
-            if isinstance(c, (discord.ui.Button, discord.ui.Select)):
-                c.disabled = True
-        await interaction.response.edit_message(view=self)
+        await interaction.response.defer()
+        await interaction.delete_original_response()
         self.stop()
         await run_round(interaction, self.bet, {'mines': self.mines})
 

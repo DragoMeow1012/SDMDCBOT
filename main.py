@@ -140,6 +140,22 @@ async def on_ready() -> None:
         state._worker_started = True
         asyncio.create_task(gemini_worker(state.chat_sessions))
 
+    if not state._miner_task_started:
+        state._miner_task_started = True
+        from commands.shop import (
+            start_payout_task,
+            start_role_expire_task,
+            start_pill_expire_task,
+        )
+        start_payout_task()
+        start_role_expire_task(client)
+        start_pill_expire_task(client)
+
+    if not state._persistent_views_registered:
+        state._persistent_views_registered = True
+        from commands.daily_task import register_persistent_views
+        register_persistent_views(client)
+
     await tree.sync()
     print(f'[OK] Bot ready! {len(state.chat_sessions)} channels.')
 
@@ -147,6 +163,11 @@ async def on_ready() -> None:
 @client.event
 async def on_message(msg: discord.Message) -> None:
     if msg.author == client.user:
+        return
+
+    # 真心話藥丸：在所有處理前攔截被餵藥用戶的訊息（刪除 + 改寫 + webhook 重發）
+    from commands.shop import maybe_apply_truth_pill
+    if await maybe_apply_truth_pill(msg):
         return
 
     # 只認內文直接出現 <@bot_id> 的情況；raw_mentions 不包含 @everyone / @here / 回覆自動附帶的 ping
@@ -174,8 +195,9 @@ async def on_message(msg: discord.Message) -> None:
 
     print(f'[MSG] ch={cid} [{personality}]: {raw_text[:80]}')
 
-    # 用戶身分前綴（使用伺服器顯示名稱，不再使用 ID）
-    display_name    = msg.author.display_name
+    # 用戶身分前綴：優先用商店「改名板」自訂名，否則用伺服器顯示名稱
+    from commands.shop import get_ai_nickname
+    display_name    = get_ai_nickname(str(msg.author.id)) or msg.author.display_name
     identity_prefix = f'[用戶: {display_name}]\n'
 
     prompt: str = raw_text if raw_text else '請描述這個附件的內容。'

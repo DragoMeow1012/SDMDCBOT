@@ -13,7 +13,7 @@
   - 跨到其他伺服器：第 1 次不提醒、僅顯示今日成績單；第 2 次以上才提醒
   - 不論在哪個群再打，獎勵都不會重發
 
-/查看帳戶餘額：顯示咕嚕喵碎片與打卡狀態。
+/帳戶總覽：顯示咕嚕喵碎片與打卡狀態（分頁版）。
 
 資料檔 data/morning_records.json：
 {
@@ -132,31 +132,324 @@ _FORTUNE_TIERS: list[tuple[str, int]] = [
 _FORTUNE_TOTAL: int = sum(w for _, w in _FORTUNE_TIERS)
 
 _FALLBACK_SOUP = [
-    '當你不再害怕跌倒，整個世界都會為你讓出一條路。',
-    '別讓昨天的雨，淋濕了今天的太陽。',
-    '勇敢不是不害怕，而是即使害怕也願意往前走一步。',
-    '生活不是等待風暴過去，而是學會在雨中跳舞。',
-    '不必活成誰的樣子，做自己就是最美的風景。',
-    '走得慢沒關係，只要方向是對的，遲早會抵達。',
-    '今天的努力，是明天的禮物。',
-    '把每一個平凡的日子，都過成自己喜歡的樣子。',
-    '心若向陽，無懼悲傷；步若堅定，何懼遠方。',
-    '黑夜再長，總會迎來黎明；困難再大，總會被你跨過。',
+    # 接納/自我關懷
     '善待自己，是一切美好的起點。',
-    '世界很大，請保持柔軟，繼續發光。',
-    '微笑是最便宜的禮物，卻能改變整個世界。',
+    '不必活成誰的樣子，做自己就是最美的風景。',
     '不被理解時，記得：你不需要被所有人懂，只需要被自己愛。',
+    '原諒自己曾經的不完美，那是你變得更好的證據。',
+    '對自己溫柔一點，畢竟你也只能陪自己走一輩子。',
+    '你不需要時時刻刻都堅強，允許自己脆弱也是一種勇氣。',
+    '別把自己活成別人期待的樣子，你只需要忠於自己。',
+    '休息不是浪費時間，而是為了走得更遠。',
+    '今天的你，已經比昨天的你更值得被肯定。',
+    '不必比較，每個人有自己的節奏與花期。',
+    '你不必完美，只要繼續真誠地生活就好。',
+    '允許自己慢一點，世界不會因此追不上你。',
+    '對自己說一聲謝謝，謝謝你一直沒有放棄。',
+    '善待自己的情緒，它們都是真實活著的證據。',
+    '你已經做得很好了，不要忘記也擁抱當下的自己。',
+    '無論今天如何，你都值得被自己溫柔對待。',
+    '愛自己不是自私，而是給世界最好的禮物。',
+    '不要再為了討好別人而委屈自己。',
+    '請相信，你本來就值得最好的事物。',
+    '你不需要證明什麼，光是存在就已經很珍貴。',
+
+    # 勇氣/面對
+    '勇敢不是不害怕，而是即使害怕也願意往前走一步。',
+    '當你不再害怕跌倒，整個世界都會為你讓出一條路。',
+    '真正的勇氣，是在脆弱中依然選擇前行。',
+    '害怕是正常的，但別讓它成為原地踏步的理由。',
+    '你以為走不過去的坎，回頭看都是風景。',
+    '只要還願意嘗試，就還沒有失敗。',
+    '面對未知，保持好奇而不是恐懼。',
+    '勇氣不是沒有眼淚，而是含著眼淚仍向前。',
+    '別讓「萬一」綁住你，也許「萬一」是最好的開始。',
+    '走出舒適圈的第一步，往往是最值得的一步。',
+    '當下不踏出，永遠不知道自己能走多遠。',
+    '與其後悔沒做，不如做了再說。',
+    '把恐懼變成行動的燃料，你會發現自己很強。',
+    '不確定的路才有可能，太確定的路只剩重複。',
+    '一次小小的勇敢，能改變一整年的軌跡。',
+
+    # 努力/成長
+    '今天的努力，是明天的禮物。',
+    '每一份努力，都不會被時間辜負。',
+    '走得慢沒關係，只要方向是對的，遲早會抵達。',
+    '你不需要一次就跑得很快，只要持續走在路上。',
+    '小小的進步，累積起來就是大大的改變。',
+    '默默耕耘的人，終會在不被注意時開花。',
+    '每天進步一點點，就是了不起的成就。',
+    '所有的努力，都在悄悄為你鋪路。',
+    '把汗水留給今天，把驕傲留給未來。',
+    '不必和別人比，跟昨天的自己比就夠了。',
+    '當下的辛苦，是未來的養分。',
+    '熬過去的不是時間，是不放棄的自己。',
+    '不努力的人，最容易把不可能掛在嘴邊。',
+    '世界從不辜負認真生活的人。',
+    '每個堅持下來的人，都會在某個時刻謝謝自己。',
+    '你播下的每一顆種子，都會在合適的時節發芽。',
+    '不要小看每天 1% 的累積。',
+    '練習不會立刻看到成果，但會慢慢改變你。',
+    '所有閃閃發光的人，都曾在無人看見的地方努力。',
+    '把今天當作未來最年輕的一天，就會更想行動。',
+
+    # 失敗/挫折
     '每一次跌倒，都是為了讓你站得更穩。',
-    '把焦慮留給昨天，把希望留給今天。',
+    '失敗不是終點，是重新出發的起點。',
+    '挫折是化了妝的祝福，請別急著拒絕。',
+    '走錯路也是經驗，至少你知道哪裡不是答案。',
+    '受過的傷，會變成保護你的鎧甲。',
+    '別讓一次失敗定義整個你。',
+    '低谷的好處是，往哪走都是上坡。',
+    '失敗教會你的事，比成功還多。',
+    '允許自己難過，但不要停在那裡。',
+    '挫折面前的眼淚，是下次更堅強的種子。',
+    '人生不怕跌倒，怕的是不肯再爬起來。',
+    '所有偉大的故事，都有狼狽的開頭。',
+    '失敗只是還沒成功的代名詞。',
+    '不完美的過程，也是值得被擁抱的。',
+    '把失敗當成反饋，而不是判決。',
+
+    # 希望/光亮
+    '別讓昨天的雨，淋濕了今天的太陽。',
+    '黑夜再長，總會迎來黎明；困難再大，總會被你跨過。',
+    '即使前方還是黑暗，也別忘了你自己就是一束光。',
+    '把希望留給今天，把焦慮留給昨天。',
+    '心若向陽，無懼悲傷；步若堅定，何懼遠方。',
+    '只要你不放棄，世界就不會放棄你。',
+    '陰天之後，總有比平常更亮的太陽。',
+    '當你看不見星星，記得你正在星星之上。',
+    '別在最黑暗的時候否定自己，那只是黎明前的等待。',
+    '生活的甜，往往藏在熬過去的苦裡。',
+    '相信光，光就在你心裡。',
+    '當你感到絕望，請記得你曾走過更難的路。',
+    '希望像種子，撒在心裡，總有一天會發芽。',
+    '不論天氣如何，你都能為自己撐起一片晴空。',
+    '看不見的未來，也不一定是壞事。',
+    '人生最好的時光，往往是你不肯放棄的那一刻之後。',
+    '每一個明天，都是命運給你的新機會。',
+    '只要心裡有光，再深的夜都不算長。',
+
+    # 平靜/接受
+    '生活不是等待風暴過去，而是學會在雨中跳舞。',
+    '不必焦急，該來的會來，該走的會走。',
+    '保留三分鐘的安靜，給疲憊的自己。',
+    '世界很大，請保持柔軟，繼續發光。',
+    '能讓你慌的，從來不是事情本身。',
+    '深呼吸，把不該帶上的事情留在這裡。',
+    '靜下來，你才聽得見自己的心跳。',
+    '比起跑得快，更重要的是不迷失方向。',
+    '無風的湖面，才能映照星空。',
+    '與其抓住一切，不如學會輕輕放下。',
+    '生活的喧囂裡，留一個安靜的角落給自己。',
+    '當你停下來，世界會用另一種方式擁抱你。',
+    '走慢一點，也是一種前進。',
+    '允許事情不完美，是最寬厚的禮物。',
+    '別被情緒帶著走，先給自己一杯溫水。',
+
+    # 時間/耐心
+    '時間不會辜負，那些一直走在路上的人。',
+    '別急，最好的事物，往往最值得等待。',
+    '今天的種子，明天會長成意想不到的風景。',
+    '時間能稀釋的，從來都不是真正的傷。',
+    '慢慢來，比較快。',
+    '所有來不及的失望，都會變成下一個契機。',
+    '耐心是把時間變成寶藏的魔法。',
+    '別讓速度欺騙了方向。',
+    '日子是用一天天活的，不是用一年年想的。',
+    '長得慢的樹，往往最堅固。',
+    '人生像泡茶，急不得，需要時間慢慢回甘。',
+    '靜待花開，是對生命最大的信任。',
+    '與時間做朋友，它會給你最好的見證。',
+    '走過的每一步，都會在未來連成一條路。',
+    '時間答得出來的問題，就先不要急。',
+
+    # 改變/嘗試
+    '把每一個平凡的日子，都過成自己喜歡的樣子。',
+    '改變從來不嫌晚，只怕你還沒開始。',
+    '生活的轉折點，往往就是你決定不再等的那一刻。',
+    '試一次，總比後悔一輩子好。',
+    '與其抱怨環境，不如改變心境。',
+    '每一個新的開始，都是命運給的小禮物。',
+    '勇於放下，才能擁有更輕盈的明天。',
+    '不喜歡的事，可以改；喜歡的事，要堅持。',
+    '改變的勇氣，比改變本身更珍貴。',
+    '把「也許」改成「立刻」，人生就不一樣了。',
+    '今天的決定，會在三個月後謝謝你。',
+    '不必把自己困在舊版本，你值得每天更新。',
+    '別怕重新開始，每個新開始都是進化。',
+    '人生不只有一條路，多走幾條風景才精彩。',
+    '當你不再害怕改變，世界就會為你重新洗牌。',
+
+    # 感恩/連結
+    '微笑是最便宜的禮物，卻能改變整個世界。',
+    '感謝今天的所有遇見，無論好壞。',
+    '溫柔對待身邊的人，會收到加倍的溫暖。',
+    '對遇見的善意說聲謝謝，世界就會多一份美好。',
+    '不要忘了感謝那個還在努力的自己。',
+    '世界很冷，所以你要記得發光。',
+    '幸福不一定很大，但一定要被看見。',
+    '一個真誠的擁抱，可以抵過千言萬語。',
+    '把愛說出口，別讓重要的人等。',
+    '感激不是因為擁有很多，而是因為懂得珍惜。',
+    '你身邊的每一個人，都是宇宙派來的禮物。',
+    '小小的善意，能在別人心裡種出大大的花。',
+    '懂得感謝的人，世界自然會偏愛你一些。',
+    '別讓忙碌掩蓋了愛你的人。',
+    '回家時的一句「我回來了」，就是最簡單的幸福。',
+
+    # 夢想/未來
+    '夢想不會逃跑，會逃跑的只有你。',
+    '把夢想拆成每天能做的一小步。',
+    '未來最美的樣子，是你正在努力靠近的方向。',
+    '夢想不分大小，敢開始就值得被尊敬。',
+    '把仰望變成行動，星空就會回應你。',
+    '人生最遠的距離，是想到卻沒做到。',
+    '相信夢想，比夢想本身更有力量。',
+    '把未來寫進每天的待辦事項，它就會成為現實。',
+    '別讓害怕代替了你對夢想的喜歡。',
+    '世界上最迷人的事情，是把熱愛活成日常。',
+    '所有偉大的旅程，都從一個小小的勇氣開始。',
+    '不要把夢想藏起來，說出來它會更有重量。',
+    '十年後感謝今天的自己，從今天就開始。',
+    '夢想不會因為遙遠而失效，只會因為你停下而消失。',
+    '寫下你的目標，宇宙就會悄悄為你鋪路。',
+
+    # 友情/愛
+    '真正的朋友，是在你不發光時也願意靠近你的人。',
+    '愛不只是大事，更是日常裡的細水長流。',
+    '比起被理解，更難得的是被陪伴。',
+    '能讓你做自己的人，才值得花時間。',
+    '真正的關心，不需要太多言語。',
+    '人和人之間最珍貴的，是不必解釋也懂。',
+    '比起完美的人，我們更需要真誠的人。',
+    '愛是看見彼此的不完美，仍然選擇靠近。',
+    '一份真心，可以走過十年也不褪色。',
+    '所謂緣分，是恰好遇見對的人。',
+
+    # 內在力量
+    '你內在的力量，比你想像中強大。',
+    '相信自己，是這世界給你最棒的咒語。',
+    '別小看自己一個微笑的能量。',
+    '你能走到今天，已經是奇蹟般的事。',
+    '所有的答案，其實都藏在你心裡。',
+    '不必別人肯定，你的價值你自己最清楚。',
+    '允許自己平凡，才有真正的不平凡。',
+    '當你開始喜歡自己，全世界都會跟著喜歡你。',
+    '聽從內心的聲音，那才是你真正的方向。',
+    '你比你想像中堅強得多。',
+    '別讓任何人的評價定義你的人生。',
+    '你的存在本身，就是一種光。',
+    '相信自己會好起來，這就是最大的力量。',
+    '請永遠站在自己這邊。',
+    '你想成為的人，就藏在你每天的選擇裡。',
+
+    # 小確幸
+    '一杯熱茶，可以救起整個下午。',
+    '走在陽光下時，記得對自己說一聲早安。',
+    '早晨的第一口溫水，是最簡單的療癒。',
+    '把窗戶打開，讓新的空氣陪你工作。',
+    '聽一首喜歡的歌，世界就溫柔起來。',
+    '今天的雲很好看，記得抬頭。',
+    '吃到喜歡的甜點，就是日常的小奇蹟。',
+    '一覺好眠，是身體最深的告白。',
+    '今天記得喝水，記得對自己微笑。',
+    '抱抱身邊的人，他可能正需要。',
+    '寫下今天三件感謝的事，幸福會悄悄變多。',
+    '允許自己耍廢一下，那是給靈魂的假期。',
+    '出門前抬頭看天空，心情會自己變亮。',
+    '把喜歡的事情排進今天，日子就值得了。',
+    '即使忙碌，也要記得吃飽。',
+
+    # 結尾語
+    '願你今天比昨天更喜歡自己一點。',
+    '願你的笑容比咖啡還香。',
+    '願你被世界溫柔以待，也願你溫柔回應它。',
+    '願你今晚的夢，溫柔像棉花糖。',
+    '願你內心永遠有一束光，照亮自己也照亮別人。',
+    '願你成為自己嚮往的那種大人。',
+    '願你被理解，被支持，被深深地愛著。',
+    '願你今天遇見的人，都帶給你好心情。',
+    '願你疲憊時，總有人遞上一杯溫水。',
+    '願你想做的事，都能慢慢實現。',
+    '願你日常的瑣碎裡，藏著小小的閃光。',
+    '願你被世界看見，也被自己看見。',
+    '願你今晚睡得香，明天起得早。',
+    '願你勇敢、溫柔、自由、安然。',
+    '願你今天比昨天，更靠近想成為的樣子。',
+]
+
+_FALLBACK_WHISPER = [
+    '今天也辛苦你了…慢慢來就好，你不需要立刻變得很好。',
+    '如果今天有點累，就允許自己慢一點…沒關係的，我會陪著你。',
+    '想哭就哭一下吧、不用裝堅強…喵會在這裡靜靜陪你。',
+    '把昨天的疲憊放下…今天，先好好喝一杯溫水好嗎？',
+    '不用一次就把所有事做完…一步一步來，我都在這。',
+    '你已經很努力了…今天就允許自己，被自己抱抱吧。',
+    '如果世界太吵…就把耳朵交給喵，我會替你擋一下。',
+    '今天的你，不需要完美…只要好好吃飯、好好呼吸就夠了。',
+    '想偷懶一下也沒關係…陽光會記得替你曬暖被子的。',
+    '不用急著走向遠方…喵就在這，陪你看今天的雲。',
+    '今天若覺得心裡空空的…記得我留了一個位置給你窩著。',
+    '你可以難過、可以脆弱…那都不會讓你變得不好。',
+    '把那些「應該」放下一下吧…現在，就只當一隻被疼愛的小貓。',
+    '如果今天什麼都不想做…那就一起當一隻翻肚的貓咪好了。',
+    '不需要被所有人喜歡…喵喜歡你，這樣就夠了喔。',
+    '你只是有點累而已…不是不夠好。先深呼吸一下吧。',
+    '想躲起來的時候…喵的懷裡永遠留著一個小角落。',
+    '今天的目標…只要記得對自己溫柔一點就好。',
+    '不順遂的事…就當作是去曬個太陽的小繞路吧。',
+    '你不需要證明什麼…光是今天願意起床，就已經很棒了。',
+    '心情灰灰的也沒關係…雲後面的太陽，一直都在。',
+    '今天就把自己當成最重要的客人…好好招待一下吧。',
+    '不必和昨天的自己比較…你願意醒來，就是溫柔的開始。',
+    '想躲進被窩多五分鐘…那就躲吧，喵會幫你看著時間。',
+    '把肩膀放鬆一點…你已經扛了很多了。',
 ]
 
 _FALLBACK_LUCKY = [
-    '溫熱奶茶', '糖葫蘆', '熱呼呼包子', '小熊軟糖',
+    # 飲品
+    '溫熱奶茶', '熱拿鐵', '黑咖啡', '可可亞',
+    '冰珍珠奶茶', '熱可可', '蜂蜜檸檬', '麥茶',
+    '優酪乳', '豆漿', '米漿', '養樂多',
+    # 甜點
     '巧克力布丁', '草莓棒棒糖', '檸檬塔', '抹茶蛋糕',
-    '銅鑼燒', '馬卡龍', '蘋果汁', '一顆水蜜桃',
-    '櫻花髮夾', '貓爪襪', '可愛口罩', '潤唇膏',
-    '護手霜', '保溫杯', '療癒手帳本', '楓葉書籤',
-    '幸運星貼紙', '彩虹原子筆', '蘋果造型橡皮擦', '兔子玩偶',
+    '銅鑼燒', '馬卡龍', '小熊軟糖', '糖葫蘆',
+    '雞蛋糕', '芋頭酥', '紅豆餅', '夾心餅乾',
+    # 鹹食
+    '熱呼呼包子', '溫泉蛋', '飯糰', '茶葉蛋',
+    '便利商店御飯糰', '便當', '玉子燒', '咖哩飯',
+    # 水果
+    '一顆水蜜桃', '蘋果汁', '香蕉', '草莓',
+    '柳橙', '葡萄', '芒果', '小蕃茄',
+    # 零食
+    '洋芋片', '海苔', '魷魚絲', '牛軋糖',
+    # 文具
+    '彩虹原子筆', '蘋果造型橡皮擦', '療癒手帳本', '楓葉書籤',
+    '幸運星貼紙', '可愛便利貼', '螢光筆', '迴紋針',
+    # 飾品
+    '櫻花髮夾', '黑色髮圈', '小耳環', '簡約手鍊',
+    # 保養
+    '潤唇膏', '護手霜', '面膜', '小瓶香水',
+    '防曬乳', '濕紙巾',
+    # 衣物配件
+    '貓爪襪', '可愛口罩', '針織帽', '格紋圍巾',
+    '透氣手套', '長條髮帶',
+    # 日用品
+    '保溫杯', '玻璃馬克杯', '不鏽鋼水壺', '便當盒',
+    '輕便雨傘', '帆布袋', '隨身鏡', '零錢包',
+    '卡套', '小錢包',
+    # 3C 小物
+    '無線耳機', '滑鼠墊', '隨身碟', '行動電源',
+    '充電線',
+    # 家居
+    '抱枕', '小毛毯', '香氛蠟燭', '療癒小盆栽',
+    '木質相框',
+    # 運動
+    '運動毛巾', '輕量瑜伽墊', '小跳繩', '運動水壺',
+    # 紀念/雜貨
+    '兔子玩偶', '小貓造型鑰匙圈', '可愛貼紙', '日式明信片',
+    '迷你筆記本', '幸運繩手環',
 ]
 
 # (類別, 範例) — 每次呼叫 Gemini 前隨機抽一類，避免結果群聚到少數熱門品項。
@@ -241,66 +534,158 @@ def _star_bar(score: float, total: int = 10) -> str:
     return f'{bar} ({score:.1f}/{total})'
 
 
+_MORNING_GEN_MODEL = 'gemini-3.1-flash-lite'
+
+
+def _is_quota_error(e: BaseException) -> bool:
+    s = str(e)
+    return '429' in s or 'RESOURCE_EXHAUSTED' in s or 'quota' in s.lower()
+
+
+async def _morning_call_with_rotation(prompt: str, system_instruction: str,
+                                      temperature: float,
+                                      timeout: float = 8.0) -> str:
+    """呼叫 _MORNING_GEN_MODEL，遇 429 自動 rotate_api_key 後重試。
+
+    重試上限 = 已設定的 GEMINI_API_KEYS 數量。其他例外直接 raise。
+    每次重試會抓 gemini_worker._client 最新 reference（rotate 後會換新 client）。
+    """
+    from google.genai import types
+
+    import gemini_worker
+    from config import GEMINI_API_KEYS
+
+    cfg = types.GenerateContentConfig(
+        temperature=temperature,
+        top_p=0.95,
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+        system_instruction=system_instruction,
+    )
+
+    def _call() -> str:
+        client = gemini_worker._client
+        if client is None:
+            raise RuntimeError('gemini client not initialised')
+        resp = client.models.generate_content(
+            model=_MORNING_GEN_MODEL, contents=prompt, config=cfg,
+        )
+        return (resp.text or '').strip()
+
+    n = max(1, len(GEMINI_API_KEYS))
+    last_err: BaseException | None = None
+    for attempt in range(n):
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(_call), timeout=timeout)
+        except Exception as e:
+            last_err = e
+            if not _is_quota_error(e) or attempt == n - 1:
+                raise
+            print(f'[MORNING-GEN] 429 quota，rotate key (try {attempt + 1}/{n})')
+            gemini_worker.rotate_api_key()
+    assert last_err is not None
+    raise last_err
+
+
+_SOUP_SYS = (
+    '你是一位充滿創意與哲理的占卜師，每次都要為使用者寫出獨一無二、'
+    '風格多變的心靈雞湯，避免重複常見套話。\n'
+    '輸出規則：20~50 字、繁體中文、只回覆語錄本身，'
+    '不加引號、標題、署名或表情符號。'
+)
+
+_WHISPER_SYS = (
+    '你是一位溫柔、細心、充滿陪伴感的貓系守護者「小龍喵」。\n'
+    '請為使用者生成一段名為「微光私語」的早安暖心短句。\n'
+    '\n'
+    '【語氣】極具溫度、溫柔、輕柔、有包容力。像默默陪在身邊的摯友，'
+    '或貼在主人懷裡撒嬌的貓咪。\n'
+    '【情感】主打「情感陪伴」與「自我和解」。給予安慰、理解，'
+    '與「沒關係，你已經很棒了」的安心感；不講大道理，不說強行正能量的官話。\n'
+    '【主題】每次隨機從以下方向擇一切入：\n'
+    '  1. 允許不完美：今天可以累、可以放空、可以不那麼努力\n'
+    '  2. 自我照顧：多愛自己、溫柔對待身體與情緒\n'
+    '  3. 微小陪伴：無論如何我都會陪著你\n'
+    '  4. 轉念療癒：把不順遂化為「只是去曬太陽、睡個覺」的溫馨比喻\n'
+    '【絕對禁止】嚴禁說教、嚴禁狼性或職場雞湯、嚴禁過於冗長的排比句。\n'
+    '\n'
+    '【輸出規則 — 嚴格遵守】\n'
+    '- 1~2 句話，40~70 字\n'
+    '- 善用「…」、「、」營造輕柔節奏\n'
+    '- 繁體中文，只輸出內容本身\n'
+    '- 不加引號、標題、署名、表情符號、前言或後記'
+)
+
+_LUCKY_SYS = (
+    '你是占卜師，要從指定類別中為使用者挑一個「今日幸運物」。\n'
+    '必須是「日常真實、容易接觸」的具體物品：'
+    '便利商店、超市、學校、家裡廚房或桌面上隨手能拿到的東西，'
+    '價格便宜、無需特別跑去找。\n'
+    '禁止：奇幻、魔法、會發光、虛構角色周邊、扭蛋、古董、收藏品、限定品、高價精品。\n'
+    '\n'
+    '【輸出格式 — 嚴格遵守】\n'
+    '- 只輸出「物品名詞」本身，純名詞，不加任何修飾\n'
+    '- 嚴禁加形容詞、狀態描述、動詞、所有格、量詞、副詞\n'
+    '- 嚴禁「隨手翻開的」「療癒系」「珍藏的」「媽媽買的」「一杯」等任何前置或後置修飾\n'
+    '- 繁體中文 2~6 字\n'
+    '- 不加引號、標點、表情符號、說明、換行\n'
+    '\n'
+    '正確範例：日曆／保溫杯／原子筆／洋芋片／黑咖啡\n'
+    '錯誤範例：隨手翻開的舊日曆／療癒小日曆／一杯黑咖啡／媽媽的保溫杯'
+)
+
+
 async def _generate_soup() -> str:
     """讓 Gemini 生成一句心靈雞湯（正能量短語），失敗 fallback 內建清單。"""
     try:
-        from gemini_worker import _client  # type: ignore[attr-defined]
-        from config import GEMINI_MODEL_NAME
-        if _client is None:
-            raise RuntimeError('gemini client not initialised')
-
-        def _call() -> str:
-            resp = _client.models.generate_content(
-                model=GEMINI_MODEL_NAME,
-                contents=(
-                    '請隨機生成一句「心靈雞湯」，提供溫暖正能量的短語或語錄。'
-                    '20~50 字、使用繁體中文。'
-                    '只回覆語錄本身，不加引號、標題、署名、表情符號。'
-                ),
-            )
-            return (resp.text or '').strip()
-
-        text = await asyncio.wait_for(asyncio.to_thread(_call), timeout=8.0)
-        text = text.splitlines()[0].strip(' 「」"\'：:　')
+        text = await _morning_call_with_rotation(
+            prompt='請隨機生成今日的一句心靈雞湯。',
+            system_instruction=_SOUP_SYS,
+            temperature=2.0,
+        )
+        text = (text.splitlines()[0].strip(' 「」"\'：:　')
+                if text else '')
         return text[:120] if text else random.choice(_FALLBACK_SOUP)
-    except Exception:
+    except Exception as e:
+        print(f'[SOUP] fallback ({type(e).__name__}): {e}')
         return random.choice(_FALLBACK_SOUP)
+
+
+async def _generate_whisper() -> str:
+    """讓 Gemini 生成一段「微光私語」（溫柔陪伴感短句），失敗 fallback 內建清單。"""
+    try:
+        text = await _morning_call_with_rotation(
+            prompt='請隨機生成今日的一段「微光私語」。',
+            system_instruction=_WHISPER_SYS,
+            temperature=1.8,
+        )
+        text = text.strip(' 「」"\'：:　') if text else ''
+        return text[:140] if text else random.choice(_FALLBACK_WHISPER)
+    except Exception as e:
+        print(f'[WHISPER] fallback ({type(e).__name__}): {e}')
+        return random.choice(_FALLBACK_WHISPER)
 
 
 async def _generate_lucky_item() -> str:
     """讓 Gemini 抽一項幸運物，逾時或失敗時 fallback 到內建清單。
 
     每次呼叫隨機抽一個類別塞進 prompt，避免 Gemini 收斂到少數熱門答案；
-    並調高 temperature 讓同類別內也有變化。
+    最高 temperature 讓同類別內也有大量變化，偏向日常隨手可拿到的物品。
     """
     category, examples = random.choice(_LUCKY_CATEGORIES)
     try:
-        from google.genai import types
-
-        from gemini_worker import _client  # type: ignore[attr-defined]
-        from config import GEMINI_MODEL_NAME
-        if _client is None:
-            raise RuntimeError('gemini client not initialised')
-
-        def _call() -> str:
-            resp = _client.models.generate_content(
-                model=GEMINI_MODEL_NAME,
-                contents=(
-                    f'從「{category}」這個類別，挑一項今天的「幸運物」。\n'
-                    f'參考方向：{examples}（請再想一個別的，不要直接重複範例）。\n'
-                    '必須是日常真實存在、隨手可得的具體物品；'
-                    '禁止奇幻、魔法、會發光、會說話、虛構角色周邊、神秘扭蛋等不真實的東西。\n'
-                    '只回覆物品名稱本身，繁體中文 4~12 字，'
-                    '不加任何說明、引號、標點、表情符號。'
-                ),
-                config=types.GenerateContentConfig(temperature=1.2),
-            )
-            return (resp.text or '').strip()
-
-        text = await asyncio.wait_for(asyncio.to_thread(_call), timeout=8.0)
-        text = text.splitlines()[0].strip(' 「」"\'：:。.！!?？　')
-        return text[:24] if text else random.choice(_FALLBACK_LUCKY)
-    except Exception:
+        text = await _morning_call_with_rotation(
+            prompt=(
+                f'從「{category}」類別，挑一項今天的幸運物。\n'
+                f'同類別參考方向：{examples}（再想一個別的，不要重複範例）。'
+            ),
+            system_instruction=_LUCKY_SYS,
+            temperature=2.0,
+        )
+        text = (text.splitlines()[0].strip(' 「」"\'：:。.！!?？　')
+                if text else '')
+        return text[:12] if text else random.choice(_FALLBACK_LUCKY)
+    except Exception as e:
+        print(f'[LUCKY] fallback (category={category}, {type(e).__name__}): {e}')
         return random.choice(_FALLBACK_LUCKY)
 
 
@@ -321,8 +706,11 @@ def _build_embed(today: dict[str, Any], guild_rank: int,
         f'今天你的幸運物是：**{today["lucky_item"]}**',
         f'【咕嚕喵碎片 +{today["coin"]}】',
         '--------------------------------------',
-        '今日雞湯：',
+        '🌸今日心靈雞湯：',
         today.get('soup', ''),
+        '--------------------------------------',
+        '☕ 微光私語：',
+        today.get('whisper', ''),
         '--------------------------------------',
         '少女祈禱中(~▽~")...您今天的運勢為...',
         f'財運：**{today["money_luck"]}**',
@@ -588,8 +976,8 @@ def setup(tree: app_commands.CommandTree) -> None:
             coin = random.randint(500, 5000)
             user_rec['balance'] = int(user_rec.get('balance', 0)) + coin
 
-            lucky, soup = await asyncio.gather(
-                _generate_lucky_item(), _generate_soup(),
+            lucky, soup, whisper = await asyncio.gather(
+                _generate_lucky_item(), _generate_soup(), _generate_whisper(),
             )
 
             money_luck = random.randint(0, 150)
@@ -604,6 +992,7 @@ def setup(tree: app_commands.CommandTree) -> None:
                 'global_rank':   len(global_order),
                 'lucky_item':    lucky,
                 'soup':          soup,
+                'whisper':       whisper,
                 'coin':          coin,
                 'money_luck':    money_luck,
                 'love_luck':     love_luck,
@@ -643,37 +1032,74 @@ def setup(tree: app_commands.CommandTree) -> None:
         )
 
 
-    @tree.command(name='查看帳戶餘額',
-                  description='查看你的咕嚕喵碎片總數與打卡狀態')
-    async def slash_balance(interaction: discord.Interaction):
-        uid  = str(interaction.user.id)
-        data = load_json(_FILE)
-        rec  = data.get('users', {}).get(uid)
-
-        if not rec:
-            embed = discord.Embed(
-                title='帳戶餘額',
-                description='你還沒有任何記錄，先用 `/早安小龍喵` 打卡吧！',
-                color=discord.Color.light_grey(),
+    @tree.command(name='帳戶總覽',
+                  description='查看自己或他人的帳戶總覽（錢包/銀行/股票/打卡/礦工）')
+    @app_commands.describe(用戶='要查看的用戶（留空看自己）')
+    async def slash_balance(
+        interaction: discord.Interaction,
+        用戶: discord.Member | None = None,
+    ):
+        target = 用戶 or interaction.user
+        if target.bot:
+            await interaction.response.send_message(
+                '機器人沒有帳戶喵', ephemeral=True,
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        balance    = int(rec.get('balance', 0))
-        total_days = int(rec.get('total_days', 0))
-        streak     = int(rec.get('streak', 0))
+        await interaction.response.defer()
 
-        embed = discord.Embed(
-            title='帳戶餘額',
-            description=(
-                f'**{interaction.user.display_name}** 的小金庫\n'
-                f'咕嚕喵碎片：**{balance}**\n'
-                f'累計打卡：**{total_days}** 天\n'
-                f'連續打卡：**{streak}** 天'
-            ),
-            color=discord.Color.gold(),
+        from commands.shop import (
+            MINER_CAP, REVERSE_CARD_MAX, _POTION_TIERS,
+            get_tier_until, get_today_miner_gain, get_reverse_cards,
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        from commands.stock import build_account_pages, AccountPagerView
+
+        uid  = str(target.id)
+        rec  = load_json(_FILE).get('users', {}).get(uid, {})
+        total_days   = int(rec.get('total_days', 0))
+        streak       = int(rec.get('streak', 0))
+        miners       = int(rec.get('miners', 0))
+        today_gain   = get_today_miner_gain(rec)
+        reverse_cards = get_reverse_cards(uid)
+
+        miner_lines = [
+            f'持有：**{miners}** / {MINER_CAP} 台　|　'
+            f'今日收益：**{today_gain:,}** 碎片',
+        ]
+        for tier in ('a', 'b', 'c'):
+            cfg = _POTION_TIERS[tier]
+            exp = get_tier_until(rec, tier)
+            if exp:
+                miner_lines.append(
+                    f'{cfg["emoji"]} {cfg["name"]} (×{cfg["mult"]}) 到期 '
+                    f'<t:{int(exp.timestamp())}:R>'
+                )
+
+        extra = [
+            (
+                '📅 打卡狀態',
+                f'累計：**{total_days}** 天　|　連續：**{streak}** 天',
+                False,
+            ),
+            (
+                '⛏️ 礦工',
+                '\n'.join(miner_lines),
+                False,
+            ),
+            (
+                '🎴 道具',
+                f'🪞 反轉牌 ({reverse_cards}/{REVERSE_CARD_MAX})',
+                False,
+            ),
+        ]
+        pages = await build_account_pages(
+            target.id, target.display_name,
+            title=f'🏦 {target.display_name} 的帳戶總覽',
+            extra_fields=extra,
+        )
+        await interaction.followup.send(
+            embed=pages[0], view=AccountPagerView(pages, page_idx=0),
+        )
 
 
     @tree.command(name='轉帳', description='轉帳咕嚕喵碎片給其他用戶')

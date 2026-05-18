@@ -14,3 +14,9 @@ chat_sessions: dict = {}
 
 # Worker 啟動旗標（防止重連時重複建立）
 _worker_started: bool = False
+
+# 礦工每整點派發 task 啟動旗標（防止重連時重複建立）
+_miner_task_started: bool = False
+
+# Persistent View（檢舉 / 管理員處置）註冊旗標
+_persistent_views_registered: bool = False
