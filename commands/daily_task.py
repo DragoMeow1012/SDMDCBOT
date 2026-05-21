@@ -33,6 +33,7 @@ URL 補完規則（只填數字時自動補成標準 URL）：
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import os
 import re
@@ -53,7 +54,7 @@ except ImportError:
     _CURL_CFFI_AVAILABLE = False
 
 from utils.json_store import load_json, save_json_async
-from commands._wallet import apply_delta
+from commands._wallet import apply_delta, get_balance
 
 
 # ── 頻道 ID ─────────────────────────────────────────────────────────────
@@ -64,6 +65,7 @@ _ADMIN_CHANNEL_ID  = 1505872725107806259  # 被檢舉內容轉送的管理員頻
 _WALLET_FILE  = os.path.join('data', 'morning_records.json')
 _REPORTS_FILE = os.path.join('data', 'daily_share_reports.json')
 _BANS_FILE    = os.path.join('data', 'daily_share_bans.json')
+_COUNTER_FILE = os.path.join('data', 'daily_share_counter.json')
 
 # ── 獎勵設定 ────────────────────────────────────────────────────────────
 _TZ              = timezone(timedelta(hours=8))
@@ -72,10 +74,20 @@ _BONUS_PER_FIELD = 200                # 每填一個選填欄位
 _MAX_REWARD_NTH  = len(_BASE_REWARDS)
 _OPTIONAL_FIELDS = ('tag', 'rating')  # 計入 bonus 的選填欄位
 
+# ── 罰則設定 ────────────────────────────────────────────────────────────
+_FINE_RATE = 0.05   # 下架罰金 = 總資產 * 比例
+_FINE_MIN  = 5000   # 下架罰金最低值
+
+# ── 管理員白名單 ────────────────────────────────────────────────────────
+_ADMIN_IDS: frozenset[int] = frozenset({
+    690339490010759229,
+    404111257008865280,
+})
+
 # ── 檢舉 / 禁用設定 ─────────────────────────────────────────────────────
 _REPORT_THRESHOLD = 2   # 累積 N 票檢舉 → 轉送管理員
 _TEMP_BAN_DAYS    = 3   # 「禁 3 天」按鈕的天數
-_ADMIN_ROLE_NAME  = '本子管理員'  # /管理員 指令可用者身分組
+_ADMIN_ROLE_NAME  = '本子管理員'  # （保留：未來如要改回身分組授權用）
 
 # ── 讚 ──────────────────────────────────────────────────────────────────
 _LIKE_REWARD = 500   # 每收到一個讚，分享者拿到的碎片數
@@ -409,10 +421,46 @@ async def _save_reports(data: dict) -> None:
     await save_json_async(_REPORTS_FILE, data)
 
 
+_serial_lock = asyncio.Lock()
+
+
+async def _allocate_serial() -> int:
+    """配置一個新的流水號。受 _serial_lock 保護，避免並發競態。"""
+    async with _serial_lock:
+        data = load_json(_COUNTER_FILE) or {}
+        n = int(data.get('next', 1))
+        data['next'] = n + 1
+        await save_json_async(_COUNTER_FILE, data)
+        return n
+
+
+def _format_serial(n: int | None) -> str:
+    """流水號顯示格式。沒值就回空字串。"""
+    if n is None:
+        return ''
+    return f'#{int(n):04d}'
+
+
+def _resolve_sharer_by_serial(serial: int) -> tuple[int | None, dict | None]:
+    """從 reports.json 用流水號反查 sharer_id。已刪除/已放行的歷史紀錄也找得到。
+    回 (sharer_id, entry) 或 (None, None)。"""
+    for entry in _load_reports().values():
+        try:
+            if int(entry.get('serial') or -1) == int(serial):
+                return int(entry.get('sharer_id') or 0) or None, entry
+        except (TypeError, ValueError):
+            continue
+    return None, None
+
+
 async def _register_share_record(*, message_id: int, sharer_id: int,
                                  site: str, url: str, title: str,
                                  tag: str, rating: int | None,
-                                 thumb: str | None) -> None:
+                                 thumb: str | None, reward: int = 0,
+                                 serial: int | None = None) -> int:
+    """寫一筆分享紀錄。沒給 serial 就配一個新的，回最終 serial。"""
+    if serial is None:
+        serial = await _allocate_serial()
     data = _load_reports()
     data[str(message_id)] = {
         'sharer_id':        int(sharer_id),
@@ -425,8 +473,13 @@ async def _register_share_record(*, message_id: int, sharer_id: int,
         'reporters':        [],
         'likers':           [],
         'admin_message_id': None,
+        'serial':           int(serial),
+        'reward':           int(reward),
+        'status':           'active',  # active / deleted / released
+        'penalty_applied':  False,
     }
     await _save_reports(data)
+    return int(serial)
 
 
 async def _add_liker(message_id: int, liker_id: int) -> tuple[str, dict | None]:
@@ -489,12 +542,164 @@ def _find_report_by_admin_msg(admin_message_id: int) -> tuple[str | None, dict |
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# 罰則：被檢舉達標未還原 或 被管理員下架 → 收回獎勵 + 5%/最低 5000 罰金
+# ─────────────────────────────────────────────────────────────────────────
+def _calc_fine(net_worth: int) -> int:
+    """罰金 = max(淨資產 * _FINE_RATE, _FINE_MIN)。淨資產為負時用 0 計算保底。"""
+    base = max(int(net_worth), 0)
+    return max(int(base * _FINE_RATE), _FINE_MIN)
+
+
+async def _apply_penalty(client: discord.Client, entry_key: str,
+                         entry: dict) -> bool:
+    """對一筆分享套用「下架罰則」：扣回獎勵 + 罰金，公開 @通知。
+    用 entry['penalty_applied'] 防重扣（同一筆被多按一次只扣一次）。
+    回 True 表示這次有實際執行扣款。"""
+    if entry.get('penalty_applied'):
+        return False
+    sharer_id = int(entry.get('sharer_id') or 0)
+    if sharer_id <= 0:
+        return False
+
+    reward = int(entry.get('reward') or 0)
+    uid    = str(sharer_id)
+
+    # 罰金基準 = 淨資產（錢包 + 銀行 + 股票市值）；股票模組 lazy import 避循環
+    try:
+        from commands.stock import calc_net_worth
+        net_worth = await calc_net_worth(sharer_id)
+    except Exception as e:
+        print(f'[每日任務] calc_net_worth 失敗，退回錢包餘額: '
+              f'{type(e).__name__}: {e}')
+        net_worth = get_balance(uid)
+
+    fine  = _calc_fine(net_worth)
+    total = reward + fine
+    if total > 0:
+        await apply_delta(uid, -total)
+
+    # 在 reports.json 同步標記，避免重扣
+    reports = _load_reports()
+    rec     = reports.get(entry_key)
+    if rec is not None:
+        rec['penalty_applied'] = True
+        rec['penalty'] = {
+            'reward':    reward,
+            'fine':      fine,
+            'net_worth': net_worth,
+            'at':        datetime.now(_TZ).isoformat(),
+        }
+        await _save_reports(reports)
+    entry['penalty_applied'] = True  # 同步給呼叫端在用的 dict
+
+    # 公開 @通知（_TARGET_CHANNEL_ID，作為下架的後續訊息）
+    try:
+        ch = client.get_channel(_TARGET_CHANNEL_ID)
+        if ch is None:
+            ch = await client.fetch_channel(_TARGET_CHANNEL_ID)
+        await ch.send(
+            f'<@{sharer_id}> 你分享的本子不合規範，已收回你本次任務所得 '
+            f'{reward:,} 並罰款 {fine:,}'
+            f'(淨資產{int(_FINE_RATE * 100)}%，最低 {_FINE_MIN:,})',
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+        print(f'[每日任務] 罰則通知發送失敗 uid={sharer_id}: '
+              f'{type(e).__name__}: {e}')
+    return True
+
+
+async def _mark_status(entry_key: str, status: str,
+                       extra: dict | None = None) -> None:
+    """更新一筆 entry 的 status（active / deleted / released）。"""
+    reports = _load_reports()
+    rec     = reports.get(entry_key)
+    if rec is None:
+        return
+    rec['status'] = status
+    if extra:
+        rec.update(extra)
+    await _save_reports(reports)
+
+
+def _resolve_active_share_by_serial(serial: int) -> tuple[str | None, dict | None]:
+    """找該 serial 目前處於可下架狀態（status=active 且尚未轉送 admin）的紀錄。
+    回 (message_id_str, entry) 或 (None, None)。"""
+    for key, entry in _load_reports().items():
+        try:
+            if int(entry.get('serial') or -1) != int(serial):
+                continue
+        except (TypeError, ValueError):
+            continue
+        if entry.get('status') != 'active':
+            continue
+        if entry.get('admin_message_id'):
+            continue
+        return key, entry
+    return None, None
+
+
+async def _forward_to_admin_via_serial(
+    client: discord.Client, entry_key: str, entry: dict,
+    *, banned_by: int,
+) -> int | None:
+    """走檢舉機制：刪 _TARGET_CHANNEL_ID 的原訊息 + 在 _ADMIN_CHANNEL_ID 發
+    「流水號封禁」review embed（含 AdminReportView 三按鈕）。
+    回傳 admin_message_id；失敗回 None。"""
+    # 1. 刪原訊息
+    target_channel = client.get_channel(_TARGET_CHANNEL_ID)
+    if target_channel is None:
+        try:
+            target_channel = await client.fetch_channel(_TARGET_CHANNEL_ID)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            print(f'[每日任務] 流水號封禁取不到 target channel: '
+                  f'{type(e).__name__}: {e}')
+            target_channel = None
+    if target_channel is not None:
+        try:
+            msg = await target_channel.fetch_message(int(entry_key))
+            await msg.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            print(f'[每日任務] 流水號封禁刪訊息失敗 msg={entry_key}: '
+                  f'{type(e).__name__}: {e}')
+
+    # 2. 轉送 admin channel
+    admin_channel = client.get_channel(_ADMIN_CHANNEL_ID)
+    if admin_channel is None:
+        try:
+            admin_channel = await client.fetch_channel(_ADMIN_CHANNEL_ID)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            print(f'[每日任務] 流水號封禁取不到 admin channel: '
+                  f'{type(e).__name__}: {e}')
+            return None
+    try:
+        admin_msg = await admin_channel.send(
+            embed=_build_admin_review_embed(
+                entry, entry.get('reporters', []),
+                kind='serial_ban', banned_by=banned_by,
+            ),
+            view=AdminReportView(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException as e:
+        print(f'[每日任務] 流水號封禁轉送 admin 失敗: '
+              f'{type(e).__name__}: {e}')
+        return None
+
+    # 3. 標記 admin_message_id（讓三按鈕能反查回 entry）
+    await _mark_forwarded(int(entry_key), admin_msg.id)
+    return admin_msg.id
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Embeds
 # ─────────────────────────────────────────────────────────────────────────
 def _reward_info_lines() -> list[str]:
     return [
         '**獎勵：** 第 1 次 **2000**、第 2 次 **1000**、第 3 次 **500**、第 4 次起 0',
         f'　　　　填 Tag 或 推薦度 各 +{_BONUS_PER_FIELD}（基礎 0 時 bonus 也不發）',
+        (f'⚠️ **被檢舉或被管理員指令下架** 會收回你本次任務所得'
+         f'並罰款總資產{int(_FINE_RATE * 100)}%(最低{_FINE_MIN:,})'),
     ]
 
 
@@ -563,17 +768,18 @@ def _share_embed(site: str | None) -> discord.Embed:
 def _build_share_post_embed(*, recommender: str, title: str,
                             tag: str, rating: int | None,
                             url: str, thumb: str | None,
-                            sharer_id: int) -> discord.Embed:
+                            sharer_id: int,
+                            serial: int | None = None) -> discord.Embed:
     lines = [
-        f'**推薦人：** {recommender}',
-        f'**漫畫名：** {title}',
+        f'推薦人: {recommender}',
+        f'漫畫名: {title}',
     ]
     if tag:
-        lines.append(f'**Tag / 簡介：** {tag}')
+        lines.append(f'Tag / 簡介: {tag}')
     if rating is not None:
         stars = '★' * rating + '☆' * (10 - rating)
-        lines.append(f'**推薦度：** {stars} ({rating}/10)')
-    lines.append(f'**連結：** {url}')
+        lines.append(f'推薦度: {stars} ({rating}/10)')
+    lines.append(f'連結: {url}')
     embed = discord.Embed(
         title='每日任務 - 每日分享本子',
         description='\n'.join(lines),
@@ -581,39 +787,60 @@ def _build_share_post_embed(*, recommender: str, title: str,
     )
     if thumb:
         embed.set_image(url=thumb)
-    # AdminReportView 透過 footer.text 解析出 sharer_id
-    embed.set_footer(text=f'sharer_id={sharer_id}')
+    # AdminReportView 透過 footer.text 解析出 sharer_id；流水號額外另起一行
+    footer_lines = [f'sharer_id={sharer_id}']
+    if serial is not None:
+        footer_lines.append(f'流水號:{int(serial):04d}')
+    embed.set_footer(text='\n'.join(footer_lines))
     return embed
 
 
-def _build_admin_review_embed(entry: dict, reporters: list[str]) -> discord.Embed:
-    reporters_lines = '\n'.join(f'- <@{r}>' for r in reporters) or '_(無)_'
+def _build_admin_review_embed(entry: dict, reporters: list[str],
+                              *, kind: str = 'report',
+                              banned_by: int | None = None) -> discord.Embed:
+    """kind:
+       - 'report'     → ⚠️ 每日分享本子 — 檢舉達標（由檢舉達閾值觸發）
+       - 'serial_ban' → 每日分享本子 — 流水號封禁（由管理員手動下架觸發）
+    banned_by 只在 serial_ban 模式下顯示。"""
     rating = entry.get('rating')
     title  = entry.get('title') or '(未取得)'
     tag    = entry.get('tag') or ''
+    serial = entry.get('serial')
     desc_lines = [
-        f'**推薦人：** <@{entry["sharer_id"]}>',
-        f'**漫畫名：** {title}',
+        f'推薦人: <@{entry["sharer_id"]}>',
+        f'漫畫名: {title}',
     ]
     if tag:
-        desc_lines.append(f'**Tag / 簡介：** {tag}')
+        desc_lines.append(f'Tag / 簡介: {tag}')
     if rating is not None:
         stars = '★' * rating + '☆' * (10 - rating)
-        desc_lines.append(f'**推薦度：** {stars} ({rating}/10)')
-    desc_lines.append(f'**連結：** {entry.get("url")}')
-    desc_lines += [
-        '',
-        f'**檢舉人 ({len(reporters)})：**',
-        reporters_lines,
-    ]
+        desc_lines.append(f'推薦度: {stars} ({rating}/10)')
+    desc_lines.append(f'連結: {entry.get("url")}')
+    desc_lines.append('')
+    if kind == 'serial_ban':
+        if banned_by:
+            desc_lines.append(f'操作管理員: <@{banned_by}>')
+        title_text = '⚠️ 每日分享本子 — 流水號封禁'
+        color = discord.Color.dark_purple()
+    else:
+        reporters_lines = '\n'.join(f'- <@{r}>' for r in reporters) or '_(無)_'
+        desc_lines += [
+            f'檢舉人 ({len(reporters)}):',
+            reporters_lines,
+        ]
+        title_text = '⚠️ 每日分享本子 — 檢舉達標'
+        color = discord.Color.dark_red()
     embed = discord.Embed(
-        title='⚠️ 每日分享本子 — 檢舉達標',
+        title=title_text,
         description='\n'.join(desc_lines),
-        color=discord.Color.dark_red(),
+        color=color,
     )
     if thumb := entry.get('thumb'):
         embed.set_image(url=thumb)
-    embed.set_footer(text=f'sharer_id={entry["sharer_id"]}')
+    footer_lines = [f'sharer_id={entry["sharer_id"]}']
+    if serial is not None:
+        footer_lines.append(f'流水號:{int(serial):04d}')
+    embed.set_footer(text='\n'.join(footer_lines))
     return embed
 
 
@@ -830,19 +1057,38 @@ class AdminReportView(discord.ui.View):
         sharer_id = await self._guard(interaction)
         if sharer_id is None:
             return
-        entry = await _set_ban(
+        await interaction.response.defer()
+
+        ban_entry = await _set_ban(
             str(sharer_id), btype='temp',
             days=_TEMP_BAN_DAYS, by=interaction.user.id,
         )
-        until = entry.get('until')
+        until = ban_entry.get('until')
         until_disp = ''
         if until:
             ts = int(datetime.fromisoformat(until).timestamp())
             until_disp = f'，至 <t:{ts}:f>'
-        await interaction.response.defer()
+
+        # 「禁用」也算下架未還原 → 同時觸發罰則（penalty_applied 防重扣）
+        penalty_note = ''
+        admin_msg_id = interaction.message.id if interaction.message else None
+        if admin_msg_id is not None:
+            entry_key, entry = _find_report_by_admin_msg(admin_msg_id)
+            if entry_key is not None and entry is not None:
+                applied = await _apply_penalty(
+                    interaction.client, entry_key, entry,
+                )
+                await _mark_status(entry_key, 'deleted')
+                if applied:
+                    p = entry.get('penalty') or {}
+                    penalty_note = (
+                        f'\n💸 已收回獎勵 {int(p.get("reward", 0)):,} + '
+                        f'罰金 {int(p.get("fine", 0)):,}'
+                    )
+
         await self._append_outcome(
             interaction,
-            f'禁用 <@{sharer_id}> {_TEMP_BAN_DAYS} 天{until_disp}',
+            f'禁用 <@{sharer_id}> {_TEMP_BAN_DAYS} 天{until_disp}{penalty_note}',
         )
 
     @discord.ui.button(
@@ -856,20 +1102,29 @@ class AdminReportView(discord.ui.View):
         if sharer_id is None:
             return
         await interaction.response.defer()
-        # 原訊息在轉送當下已被撤下，這裡只需清掉 report 紀錄並標註結果。
+
+        # 原訊息在轉送當下已被撤下，這裡：
+        # 1) 套用罰則（扣獎勵 + 罰金 + @通知，penalty_applied 防重）
+        # 2) 標記 entry status=deleted（保留歷史，供日後依流水號封禁查得到）
+        penalty_note = ''
         admin_msg_id = interaction.message.id if interaction.message else None
         if admin_msg_id is not None:
-            entry_key, _entry = _find_report_by_admin_msg(admin_msg_id)
-            if entry_key is not None:
-                try:
-                    reports = _load_reports()
-                    reports.pop(entry_key, None)
-                    await _save_reports(reports)
-                except Exception as e:
-                    print(f'[每日任務] 刪除清 report 紀錄失敗 key={entry_key}: '
-                          f'{type(e).__name__}: {e}')
+            entry_key, entry = _find_report_by_admin_msg(admin_msg_id)
+            if entry_key is not None and entry is not None:
+                applied = await _apply_penalty(
+                    interaction.client, entry_key, entry,
+                )
+                await _mark_status(entry_key, 'deleted')
+                if applied:
+                    p = entry.get('penalty') or {}
+                    penalty_note = (
+                        f'\n💸 已收回獎勵 {int(p.get("reward", 0)):,} + '
+                        f'罰金 {int(p.get("fine", 0)):,}'
+                    )
+
         await self._append_outcome(
-            interaction, f'刪除：保留下架，<@{sharer_id}> 的分享不會還原',
+            interaction,
+            f'刪除：保留下架，<@{sharer_id}> 的分享不會還原{penalty_note}',
         )
 
     @discord.ui.button(
@@ -920,6 +1175,8 @@ class AdminReportView(discord.ui.View):
 
         # 3. 重建 embed 並 repost（保留「讚」按鈕，移除「檢舉」按鈕）
         #    JM 需要重新下載 cover bytes 走附件（CDN 不開放 Discord proxy）
+        prev_serial = entry.get('serial')
+        prev_reward = int(entry.get('reward') or 0)
         restore_kwargs: dict[str, Any] = {
             'view': ReportView(with_report=False),
         }
@@ -942,6 +1199,7 @@ class AdminReportView(discord.ui.View):
             url=entry.get('url') or '',
             thumb=embed_thumb,
             sharer_id=int(sharer_id),
+            serial=int(prev_serial) if prev_serial is not None else None,
         )
         restore_kwargs['embed'] = restored
         try:
@@ -952,13 +1210,13 @@ class AdminReportView(discord.ui.View):
             )
             return
 
-        # 4. 清掉舊 report 紀錄 + 為還原訊息建新紀錄（讓讚按鈕能繼續記）
+        # 4. 舊紀錄標記 released 並指向新訊息；新訊息建新紀錄繼承同個 serial
+        #    （流水號不會因為「放行」而被洗掉，且 likers/penalty 狀態移到新紀錄）
         try:
-            reports = _load_reports()
-            reports.pop(entry_key, None)
-            await _save_reports(reports)
+            await _mark_status(entry_key, 'released',
+                               {'restored_message_id': restored_msg.id})
         except Exception as e:
-            print(f'[每日任務] 放行清 report 紀錄失敗 key={entry_key}: '
+            print(f'[每日任務] 放行標記 released 失敗 key={entry_key}: '
                   f'{type(e).__name__}: {e}')
         try:
             await _register_share_record(
@@ -970,6 +1228,8 @@ class AdminReportView(discord.ui.View):
                 tag=entry.get('tag') or '',
                 rating=entry.get('rating'),
                 thumb=entry.get('thumb'),
+                reward=prev_reward,
+                serial=int(prev_serial) if prev_serial is not None else None,
             )
         except Exception as e:
             print(f'[每日任務] 放行還原訊息建新 record 失敗 msg={restored_msg.id}: '
@@ -1148,7 +1408,11 @@ class DailyShareModal(discord.ui.Modal, title='每日分享本子'):
         if not title:
             title = '(無法取得標題)'
 
-        # 5. 發 embed 到目標頻道（含「檢舉」按鈕）
+        # 5. 先結算獎勵（要把 reward 寫進 register，供日後下架罰則用）+ 配流水號
+        nth, reward = await _claim_daily_share_reward(self.uid, optional_filled)
+        serial = await _allocate_serial()
+
+        # 6. 發 embed 到目標頻道（含「檢舉」按鈕，title 帶 #流水號）
         recommender = (
             interaction.user.display_name
             if isinstance(interaction.user, discord.Member)
@@ -1168,6 +1432,7 @@ class DailyShareModal(discord.ui.Modal, title='每日分享本子'):
             title=title, tag=tag_raw, rating=rating,
             url=url, thumb=embed_thumb,
             sharer_id=interaction.user.id,
+            serial=serial,
         )
         send_kwargs['embed'] = post_embed
         try:
@@ -1178,20 +1443,18 @@ class DailyShareModal(discord.ui.Modal, title='每日分享本子'):
             )
             return
 
-        # 6. 記錄分享內容供日後檢舉用
+        # 7. 記錄分享內容供日後檢舉 / 罰則使用
         try:
             await _register_share_record(
                 message_id=sent_msg.id,
                 sharer_id=interaction.user.id,
                 site=self.site, url=url, title=title,
                 tag=tag_raw, rating=rating, thumb=thumb,
+                reward=reward, serial=serial,
             )
         except Exception as e:
             print(f'[每日任務] register share record 失敗 msg={sent_msg.id}: '
                   f'{type(e).__name__}: {e}')
-
-        # 7. 結算獎勵 → 把 Modal 的 thinking ephemeral 直接 edit 成通知留著
-        nth, reward = await _claim_daily_share_reward(self.uid, optional_filled)
         if reward > 0:
             notice = (f'🎁 你完成了每日任務，'
                       f'獲得咕嚕喵碎片 x **{reward:,}**（第 {nth} 次）')
@@ -1240,9 +1503,9 @@ def _admin_home_embed() -> discord.Embed:
         title='管理員工具 — 每日任務',
         description=(
             '🔓 **解禁用戶** — 列出目前禁用中的用戶，挑一位解禁\n'
-            f'🚫 **封禁用戶** — 輸入用戶 ID + 天數，禁用該用戶使用'
-            f'**{_TASK_LABEL_SHARE}**\n\n'
-            '_目前可控制的任務：每日分享本子（之後加新任務時這裡會加選項）_'
+            f'🚫 **暫時封禁** — 依「用戶 ID」或「流水號」封禁 N 天\n'
+            f'⛔ **永久封禁** — 依「用戶 ID」或「流水號」永久封禁\n\n'
+            f'_目標任務：**{_TASK_LABEL_SHARE}**_'
         ),
         color=discord.Color.dark_teal(),
     )
@@ -1266,14 +1529,14 @@ def _admin_unban_embed(guild: discord.Guild | None) -> discord.Embed:
 
 
 class AdminPanelHomeView(discord.ui.View):
-    """主選單：解禁用戶 / 封禁用戶（未來加新功能時插更多按鈕到這裡）。"""
+    """主選單：解禁 / 暫時封禁 / 永久封禁。後二者都是進子面板選輸入方式。"""
 
     def __init__(self, *, opener: discord.Interaction):
         super().__init__(timeout=300)
         self.opener = opener
 
     @discord.ui.button(label='解禁用戶', emoji='🔓',
-                       style=discord.ButtonStyle.success)
+                       style=discord.ButtonStyle.success, row=0)
     async def unban_btn(self, interaction: discord.Interaction,
                         _btn: discord.ui.Button) -> None:
         view = AdminUnbanView(interaction.guild, opener=self.opener)
@@ -1281,12 +1544,69 @@ class AdminPanelHomeView(discord.ui.View):
             embed=_admin_unban_embed(interaction.guild), view=view,
         )
 
-    @discord.ui.button(label='封禁用戶', emoji='🚫',
-                       style=discord.ButtonStyle.danger)
+    @discord.ui.button(label='暫時封禁', emoji='🚫',
+                       style=discord.ButtonStyle.danger, row=0)
     async def ban_btn(self, interaction: discord.Interaction,
                       _btn: discord.ui.Button) -> None:
-        await interaction.response.send_modal(
-            AdminBanModal(opener=self.opener),
+        await interaction.response.edit_message(
+            embed=_admin_ban_method_embed(perm=False),
+            view=AdminBanMethodView(opener=self.opener, perm=False),
+        )
+
+    @discord.ui.button(label='永久封禁', emoji='⛔',
+                       style=discord.ButtonStyle.danger, row=0)
+    async def perm_ban_btn(self, interaction: discord.Interaction,
+                           _btn: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            embed=_admin_ban_method_embed(perm=True),
+            view=AdminBanMethodView(opener=self.opener, perm=True),
+        )
+
+
+def _admin_ban_method_embed(*, perm: bool) -> discord.Embed:
+    label = '永久封禁' if perm else '暫時封禁'
+    return discord.Embed(
+        title=f'管理員 — {label}',
+        description=(
+            f'**{label}** — 選擇輸入方式：\n\n'
+            '🆔 **依用戶 ID** — 直接輸入 sharer_id\n'
+            '🔢 **依流水號** — 輸入該本子的流水號（#XXXX），自動帶出 sharer_id'
+        ),
+        color=discord.Color.dark_red() if perm else discord.Color.dark_orange(),
+    )
+
+
+class AdminBanMethodView(discord.ui.View):
+    """子面板：選擇封禁輸入方式（依用戶 ID / 依流水號）。perm 旗標決定要不要問天數。"""
+
+    def __init__(self, *, opener: discord.Interaction, perm: bool):
+        super().__init__(timeout=300)
+        self.opener = opener
+        self.perm   = perm
+
+    @discord.ui.button(label='依用戶 ID', emoji='🆔',
+                       style=discord.ButtonStyle.primary, row=0)
+    async def by_id_btn(self, interaction: discord.Interaction,
+                        _btn: discord.ui.Button) -> None:
+        await interaction.response.send_modal(AdminBanModal(
+            opener=self.opener, perm=self.perm,
+        ))
+
+    @discord.ui.button(label='依流水號', emoji='🔢',
+                       style=discord.ButtonStyle.primary, row=0)
+    async def by_serial_btn(self, interaction: discord.Interaction,
+                            _btn: discord.ui.Button) -> None:
+        await interaction.response.send_modal(AdminSerialBanModal(
+            opener=self.opener, perm=self.perm,
+        ))
+
+    @discord.ui.button(label='返回', emoji='↩️',
+                       style=discord.ButtonStyle.secondary, row=1)
+    async def back_btn(self, interaction: discord.Interaction,
+                       _btn: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            embed=_admin_home_embed(),
+            view=AdminPanelHomeView(opener=self.opener),
         )
 
 
@@ -1359,60 +1679,193 @@ class AdminUnbanView(discord.ui.View):
         self.add_item(back_btn)
 
 
-class AdminBanModal(discord.ui.Modal, title='封禁用戶 — 每日分享本子'):
-    uid_input = discord.ui.TextInput(
-        label='用戶 ID（sharer_id，純數字）',
-        placeholder='例：404111257008865280',
-        required=True,
-        min_length=5,
-        max_length=25,
-    )
-    days_input = discord.ui.TextInput(
-        label='禁用天數（正整數）',
-        placeholder=f'1 ~ {_MAX_BAN_DAYS}',
-        required=True,
-        max_length=4,
-    )
+class AdminBanModal(discord.ui.Modal):
+    """依用戶 ID 封禁。perm=True 不問天數。"""
 
-    def __init__(self, *, opener: discord.Interaction):
-        super().__init__()
+    def __init__(self, *, opener: discord.Interaction, perm: bool):
+        super().__init__(title=f'{"永久" if perm else "暫時"}封禁 — 依用戶 ID')
         self.opener = opener
+        self.perm   = perm
+
+        self.uid_input = discord.ui.TextInput(
+            label='用戶 ID（sharer_id，純數字）',
+            placeholder='例：404111257008865280',
+            required=True, min_length=5, max_length=25,
+        )
+        self.add_item(self.uid_input)
+
+        if not perm:
+            self.days_input: discord.ui.TextInput | None = discord.ui.TextInput(
+                label='禁用天數（正整數）',
+                placeholder=f'1 ~ {_MAX_BAN_DAYS}',
+                required=True, max_length=4,
+            )
+            self.add_item(self.days_input)
+        else:
+            self.days_input = None
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        uid_raw  = (str(self.uid_input.value) or '').strip()
-        days_raw = (str(self.days_input.value) or '').strip()
-        if not uid_raw.isdigit():
+        uid_str = (str(self.uid_input.value) or '').strip()
+        if not uid_str.isdigit():
             await interaction.response.send_message(
                 '用戶 ID 必須是純數字喵', ephemeral=True,
             )
             return
-        if not days_raw.isdigit():
-            await interaction.response.send_message(
-                '天數必須是正整數喵', ephemeral=True,
-            )
-            return
-        days = int(days_raw)
-        if not 1 <= days <= _MAX_BAN_DAYS:
-            await interaction.response.send_message(
-                f'天數範圍是 1 ~ {_MAX_BAN_DAYS} 喵', ephemeral=True,
-            )
-            return
 
-        entry = await _set_ban(
-            uid_raw, btype='temp', days=days, by=interaction.user.id,
+        days: int | None = None
+        if not self.perm:
+            days_raw = (str(self.days_input.value) or '').strip() if self.days_input else ''
+            if not days_raw.isdigit():
+                await interaction.response.send_message(
+                    '天數必須是正整數喵', ephemeral=True,
+                )
+                return
+            days = int(days_raw)
+            if not 1 <= days <= _MAX_BAN_DAYS:
+                await interaction.response.send_message(
+                    f'天數範圍是 1 ~ {_MAX_BAN_DAYS} 喵', ephemeral=True,
+                )
+                return
+
+        btype = 'perm' if self.perm else 'temp'
+        ban_entry = await _set_ban(
+            uid_str, btype=btype, days=days, by=interaction.user.id,
         )
-        until_str = entry.get('until') or ''
-        until_disp = ''
-        if until_str:
-            ts = int(datetime.fromisoformat(until_str).timestamp())
-            until_disp = f'，至 <t:{ts}:f>'
+
+        if self.perm:
+            notice = f'⛔ 已永久封禁 <@{uid_str}> — {_TASK_LABEL_SHARE}'
+        else:
+            until_str = ban_entry.get('until') or ''
+            until_disp = ''
+            if until_str:
+                ts = int(datetime.fromisoformat(until_str).timestamp())
+                until_disp = f'，至 <t:{ts}:f>'
+            notice = (f'🚫 已禁用 <@{uid_str}> {days} 天 — '
+                      f'{_TASK_LABEL_SHARE}{until_disp}')
+
         await interaction.response.send_message(
-            f'🚫 已禁用 <@{uid_raw}> {days} 天 — '
-            f'{_TASK_LABEL_SHARE}{until_disp}',
-            ephemeral=True,
+            notice, ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
-        # 操作完回到主選單（顯示最新狀態）
+        try:
+            await self.opener.edit_original_response(
+                embed=_admin_home_embed(),
+                view=AdminPanelHomeView(opener=self.opener),
+            )
+        except discord.HTTPException:
+            pass
+
+
+class AdminSerialBanModal(discord.ui.Modal):
+    """依流水號處置 — 一律走檢舉機制（刪原訊息 + 轉送 admin channel review）。
+    perm=True 流程順便永久 ban 該 sharer；perm=False 視天數欄決定：
+       - 留空：純走檢舉，不 ban 用戶
+       - 1~_MAX_BAN_DAYS：同時 temp ban 該天數
+    最終由 admin 在 review channel 三按鈕（禁用 / 刪除 / 放行）決定罰則。"""
+
+    def __init__(self, *, opener: discord.Interaction, perm: bool):
+        super().__init__(title=f'{"永久" if perm else "流水號"}封禁 — 依流水號')
+        self.opener = opener
+        self.perm   = perm
+
+        self.serial_input = discord.ui.TextInput(
+            label='流水號（純數字，例：42 對應 #0042）',
+            placeholder='例：42',
+            required=True, min_length=1, max_length=10,
+        )
+        self.add_item(self.serial_input)
+
+        if not perm:
+            self.days_input: discord.ui.TextInput | None = discord.ui.TextInput(
+                label='封禁天數（留空 = 只走檢舉、不 ban）',
+                placeholder=f'1 ~ {_MAX_BAN_DAYS}（留空不 ban）',
+                required=False, max_length=4,
+            )
+            self.add_item(self.days_input)
+        else:
+            self.days_input = None
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        raw = (str(self.serial_input.value) or '').strip()
+        if not raw.isdigit():
+            await interaction.response.send_message(
+                '流水號必須是純數字喵', ephemeral=True,
+            )
+            return
+        serial = int(raw)
+
+        # 驗證天數（若有填）— 在 defer 前先擋掉格式錯誤
+        days: int | None = None
+        if not self.perm and self.days_input is not None:
+            days_raw = (str(self.days_input.value) or '').strip()
+            if days_raw:
+                if not days_raw.isdigit():
+                    await interaction.response.send_message(
+                        '天數必須是純數字喵', ephemeral=True,
+                    )
+                    return
+                days = int(days_raw)
+                if not 1 <= days <= _MAX_BAN_DAYS:
+                    await interaction.response.send_message(
+                        f'天數範圍是 1 ~ {_MAX_BAN_DAYS} 喵',
+                        ephemeral=True,
+                    )
+                    return
+
+        # 找該 serial 目前 active 的分享紀錄
+        entry_key, entry = _resolve_active_share_by_serial(serial)
+        if entry_key is None or entry is None:
+            await interaction.response.send_message(
+                f'找不到流水號 {_format_serial(serial)} 目前 active 的分享'
+                f'（可能已被處置 / 流水號不存在）',
+                ephemeral=True,
+            )
+            return
+        sharer_id = int(entry.get('sharer_id') or 0)
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # 1. 走檢舉機制：刪原訊息 + 轉送 admin
+        admin_msg_id = await _forward_to_admin_via_serial(
+            interaction.client, entry_key, entry,
+            banned_by=interaction.user.id,
+        )
+
+        # 2. 視 perm / days 決定是否同時封禁該用戶
+        ban_note = ''
+        if self.perm:
+            await _set_ban(
+                str(sharer_id), btype='perm', days=None,
+                by=interaction.user.id,
+            )
+            ban_note = f'\n⛔ 已永久封禁 <@{sharer_id}>'
+        elif days is not None:
+            ban_entry = await _set_ban(
+                str(sharer_id), btype='temp', days=days,
+                by=interaction.user.id,
+            )
+            until_str = ban_entry.get('until') or ''
+            until_disp = ''
+            if until_str:
+                ts = int(datetime.fromisoformat(until_str).timestamp())
+                until_disp = f'，至 <t:{ts}:f>'
+            ban_note = (f'\n🚫 已封禁 <@{sharer_id}> {days} 天{until_disp}')
+
+        if admin_msg_id is None:
+            await interaction.followup.send(
+                f'⚠️ 轉送 admin channel 失敗，但流水號 {_format_serial(serial)} '
+                f'本子的訊息已嘗試收回{ban_note}',
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await interaction.followup.send(
+                f'✅ 流水號 {_format_serial(serial)} 已收回原訊息並轉送 '
+                f'<#{_ADMIN_CHANNEL_ID}> 審核{ban_note}',
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
         try:
             await self.opener.edit_original_response(
                 embed=_admin_home_embed(),
@@ -1440,12 +1893,9 @@ def setup(tree: app_commands.CommandTree) -> None:
     @tree.command(name='管理員',
                   description='管理員工具：每日任務 封禁 / 解禁')
     async def slash_admin(interaction: discord.Interaction):
-        member = interaction.user
-        if (not isinstance(member, discord.Member)
-                or not any(r.name == _ADMIN_ROLE_NAME for r in member.roles)):
+        if interaction.user.id not in _ADMIN_IDS:
             await interaction.response.send_message(
-                f'此指令只有「{_ADMIN_ROLE_NAME}」身分組可以使用喵',
-                ephemeral=True,
+                '你沒有使用此指令的權限喵', ephemeral=True,
             )
             return
         view = AdminPanelHomeView(opener=interaction)

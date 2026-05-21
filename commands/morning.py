@@ -4,7 +4,7 @@
   - 依時段切換標題：早安 / 午安 / 暮色（0~3 點禁止打卡）
   - 全域 + 本群排名
   - 累計 / 連續打卡天數
-  - 咕嚕喵碎片 500~5000 隨機獎勵（每日全域只發一次）
+  - 咕嚕喵碎片 1000~6000 隨機獎勵（每日全域只發一次）
   - Gemini 隨機生成幸運物（失敗自動 fallback）
   - 財運 / 桃花運 / 事業運 0~150 + 綜合運勢 + 星評
 
@@ -973,7 +973,7 @@ def setup(tree: app_commands.CommandTree) -> None:
             user_rec['total_days'] = int(user_rec.get('total_days', 0)) + 1
             user_rec['last_day']   = day_key
 
-            coin = random.randint(500, 5000)
+            coin = random.randint(1000, 6000)
             user_rec['balance'] = int(user_rec.get('balance', 0)) + coin
 
             lucky, soup, whisper = await asyncio.gather(
@@ -1097,8 +1097,10 @@ def setup(tree: app_commands.CommandTree) -> None:
             title=f'🏦 {target.display_name} 的帳戶總覽',
             extra_fields=extra,
         )
+        owner_uid = str(target.id) if target.id == interaction.user.id else None
         await interaction.followup.send(
-            embed=pages[0], view=AccountPagerView(pages, page_idx=0),
+            embed=pages[0],
+            view=AccountPagerView(pages, page_idx=0, owner_uid=owner_uid),
         )
 
 

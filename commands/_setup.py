@@ -16,9 +16,9 @@ import discord
 from commands._wallet import get_balance
 
 
-BET_PRESETS = [100, 500, 1000, 5000]
+BET_PRESETS = [1000, 10_000, 100_000, 1_000_000]
 MIN_BET     = 100
-MAX_BET     = 10_000_000
+MAX_BET     = 100_000_000
 
 
 def insufficient_embed(need: int, have: int) -> discord.Embed:

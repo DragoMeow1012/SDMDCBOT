@@ -1,5 +1,5 @@
 """
-/shop 主面板指令 + 礦工每整點派發 + 限時自訂身分組到期回收 + 真心話藥丸到期回收 背景任務。
+/shop 主面板指令 + 礦工每整點派發 + 限時自訂身分組到期回收 + 調教項圈到期回收 背景任務。
 
 UI 流程：
   /shop → ShopMainView (ephemeral E_main，顯示商品簡介 + 餘額 + 分類按鈕)
@@ -22,11 +22,11 @@ UI 流程：
     名字必填（自動加 [商店購買] 前綴），色號 #RRGGBB 可留空隨機，
     無任何權限。同時只能 1 個，第二次購買會把舊的砍掉換新的。
     到期由背景 task 從伺服器移除整個身分組。
-  - 真心話藥丸 (5 萬碎片 / 顆，12h 訊息被竄改)
+  - 調教項圈 (5 萬碎片 / 顆，12h 訊息被竄改)
     選定一名目標用戶，購買後 12 小時內目標發的每句文字訊息會被刪掉，
     經 buyer 自訂的 AI 指令 / 句首 / 句尾 改寫後，用 webhook 以目標的
-    名字 + 頭像重新發出。目標會掛上 [商店購買]真心話發作中 身分組。
-    撞號規則：後購買者覆蓋前者（前者不退款）。主人不免疫。
+    名字 + 頭像重新發出。目標會掛上 [商店:調教項圈] 身分組。
+    撞號規則：後購買者覆蓋前者（前者不退款）。真主人也可被戴項圈（但身分鑑別仍走 ID）。
 
 資料：
   - morning_records.json -> users[uid].miners (int, 0~10)
@@ -64,7 +64,7 @@ from utils.json_store import load_json, save_json_async
 MINER_PRICE = 100_000
 MINER_CAP   = 10
 MINER_MIN   = 1
-MINER_MAX   = 100
+MINER_MAX   = 560
 
 # ── 能量藥水（A / B / C 三階限時加成） ─────────────────────────────────
 POTION_DURATION_HOURS = 24
@@ -118,6 +118,29 @@ async def _atomic_buy(uid: str, n: int) -> tuple[bool, str, int, int]:
     rec['miners']  = cur_miners + n
     await save_json_async(_WALLET_FILE, data)
     return True, '', rec['balance'], rec['miners']
+
+
+def _has_claimed_free_miner(uid: str) -> bool:
+    return bool(load_json(_WALLET_FILE)
+                .get('users', {}).get(uid, {})
+                .get('miner_free_claimed'))
+
+
+async def _atomic_claim_free_miner(uid: str) -> tuple[bool, str, int]:
+    """每位用戶限領一次的免費礦工：rec['miner_free_claimed']=True 記號永久保留。
+    回 (success, error_msg, new_miners)。"""
+    data  = load_json(_WALLET_FILE)
+    users = data.setdefault('users', {})
+    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+    if rec.get('miner_free_claimed'):
+        return False, '你已經領過免費礦工了喵', int(rec.get('miners', 0))
+    cur_miners = int(rec.get('miners', 0))
+    if cur_miners >= MINER_CAP:
+        return False, f'已達持有上限 {MINER_CAP} 台，無法再領取', cur_miners
+    rec['miners'] = cur_miners + 1
+    rec['miner_free_claimed'] = True
+    await save_json_async(_WALLET_FILE, data)
+    return True, '', rec['miners']
 
 
 # ── 資料存取 (錢包通用扣 / 退款) ─────────────────────────────────────────
@@ -267,15 +290,20 @@ def _miner_embed(user: discord.abc.User) -> discord.Embed:
     uid     = str(user.id)
     miners  = _get_miners(uid)
     balance = get_balance(uid)
+    free_available = (not _has_claimed_free_miner(uid)) and miners < MINER_CAP
     body = [
         '**🛒 商品：礦工**',
         '',
         f'⛏️ **礦工** — `{MINER_PRICE:,}` 咕嚕喵碎片 / 台',
-        f'　每小時獲得 **{MINER_MIN}~{MINER_MAX}** 碎片／台（期望 ~50/台/小時）',
+        f'　每小時獲得 **{MINER_MIN}~{MINER_MAX}** 碎片／台（期望 ~280/台/小時）',
         f'　持有上限 **{MINER_CAP}** 台（可重複購買）',
+    ]
+    if free_available:
+        body.append('🎁 **首次免費領取 1 台**（限一次，領過就不再顯示）')
+    body += [
         '',
         f'你目前持有：**{miners}** / {MINER_CAP} 台',
-        f'預估收益：**~{miners * 50}** 碎片/小時',
+        f'預估收益：**~{miners * 280}** 碎片/小時',
         f'目前餘額：**{balance:,}** 咕嚕喵碎片',
     ]
     embed = discord.Embed(
@@ -370,6 +398,17 @@ class MinerShopView(discord.ui.View):
         balance   = get_balance(self.uid)
         remaining = MINER_CAP - miners
 
+        # 🎁 首次免費領取：沒領過 + 還有名額才顯示；領過後這顆按鈕就不再 add
+        if (not _has_claimed_free_miner(self.uid)) and remaining > 0:
+            free_btn = discord.ui.Button(
+                label='免費領取 1 台',
+                emoji='🎁',
+                style=discord.ButtonStyle.success,
+                row=0,
+            )
+            free_btn.callback = self._on_claim_free
+            self.add_item(free_btn)
+
         specs = [
             ('購買 1 台', 1),
             ('購買 5 台', 5),
@@ -383,17 +422,29 @@ class MinerShopView(discord.ui.View):
                 emoji='⛏️',
                 style=discord.ButtonStyle.primary,
                 disabled=disabled,
-                row=0,
+                row=1,
             )
             btn.callback = self._make_buy_cb(n)
             self.add_item(btn)
 
         back = discord.ui.Button(
             label='⬅️ 返回商店',
-            style=discord.ButtonStyle.secondary, row=1,
+            style=discord.ButtonStyle.secondary, row=2,
         )
         back.callback = self._back_cb
         self.add_item(back)
+
+    async def _on_claim_free(self, interaction: discord.Interaction) -> None:
+        if str(interaction.user.id) != self.uid:
+            await interaction.response.send_message(
+                '這不是你的商店', ephemeral=True,
+            )
+            return
+        ok, msg, _ = await _atomic_claim_free_miner(self.uid)
+        if not ok:
+            await interaction.response.send_message(msg, ephemeral=True)
+            return
+        await _render_main_via_edit(interaction, self.root_interaction)
 
     def _make_buy_cb(self, n: int):
         async def _cb(interaction: discord.Interaction) -> None:
@@ -779,8 +830,8 @@ def _reverse_card_embed(user: discord.abc.User) -> discord.Embed:
         '**🛒 商品：反轉牌**',
         '',
         f'🪞 **反轉牌** — `{REVERSE_CARD_PRICE:,}` 咕嚕喵碎片 / 張',
-        '　被別人對你下整蠱類道具（目前：真心話藥丸）時自動反彈，',
-        '　藥效改套用到對方身上，反轉牌使用後消失。',
+        '　被別人對你下整蠱類道具（目前：調教項圈）時自動反彈，',
+        '　效果改套用到對方身上，反轉牌使用後消失。',
         f'　持有上限 **{REVERSE_CARD_MAX}** 張（防身用，自動觸發）',
         '',
         f'目前持有：**{cards}** / {REVERSE_CARD_MAX} 張',
@@ -843,17 +894,21 @@ class ReverseCardShopView(discord.ui.View):
         await _render_main_via_edit(interaction, self.root_interaction)
 
 
-# ── 真心話藥丸 ──────────────────────────────────────────────────────────
+# ── 調教項圈 ──────────────────────────────────────────────────────────
 TRUTH_PILL_PRICE           = 50_000
 TRUTH_PILL_DURATION_HOURS  = 12
-TRUTH_PILL_ROLE_NAME       = '[商店:真心話藥丸]'
+TRUTH_PILL_ROLE_NAME       = '[商店:調教項圈]'
 TRUTH_PILL_MODEL           = 'gemini-3.1-flash-lite'
 TRUTH_PILL_PROMPT_MAX      = 400
 TRUTH_PILL_AFFIX_MAX       = 80
-_PILL_WEBHOOK_NAME         = '真心話藥丸'
+_PILL_WEBHOOK_NAME         = '調教項圈'
 _PILL_FILE = os.path.join('data', 'truth_pills.json')
+
+# ── 給小龍喵戴的項圈：buyer 自己的 prompt 覆寫（只對 buyer 自己生效，12h）─
+BOT_COLLAR_PROMPT_MAX      = 600
+_BOT_COLLAR_FILE = os.path.join('data', 'bot_collars.json')
 # 純 Discord 自訂表情符號（<:name:id> 或 <a:name:id>）+ 空白組成的訊息
-# → 無實質文字內容，AI 改寫無意義，不觸發藥效。
+# → 無實質文字內容，AI 改寫無意義，不觸發項圈效果。
 _PILL_EMOJI_ONLY_RE = re.compile(r'^\s*(?:<a?:[A-Za-z0-9_]+:\d+>\s*)+$')
 
 # 系統 prompt：no-thinking + 嚴格純輸出 + 嚴格保留原意 + 不可當問答回應。{instruction} 由 buyer 提供。
@@ -908,6 +963,51 @@ async def _drop_pill_entry(guild_id: int, user_id: int) -> None:
     await _save_pills(data)
 
 
+# ── 給小龍喵戴的項圈 storage / lookup ───────────────────────────────────
+def _bot_collar_key(guild_id: int, buyer_id: int) -> str:
+    return f'{guild_id}:{buyer_id}'
+
+
+def _load_bot_collars() -> dict:
+    return load_json(_BOT_COLLAR_FILE) or {}
+
+
+async def _save_bot_collars(data: dict) -> None:
+    await save_json_async(_BOT_COLLAR_FILE, data)
+
+
+async def _set_bot_collar(guild_id: int, buyer_id: int, prompt: str) -> None:
+    """寫入小龍喵項圈：無時限，須本人購買項圈鑰匙才能解除。"""
+    data = _load_bot_collars()
+    data[_bot_collar_key(guild_id, buyer_id)] = {
+        'guild_id': int(guild_id),
+        'buyer_id': int(buyer_id),
+        'prompt':   prompt,
+    }
+    await _save_bot_collars(data)
+
+
+async def _drop_bot_collar(guild_id: int, buyer_id: int) -> bool:
+    data = _load_bot_collars()
+    key = _bot_collar_key(guild_id, buyer_id)
+    if key in data:
+        data.pop(key, None)
+        await _save_bot_collars(data)
+        return True
+    return False
+
+
+def get_active_bot_persona(guild_id: int, user_id: int) -> str | None:
+    """供 main.py 用：取得用戶在當前 guild 是否有給小龍喵戴的項圈生效中。
+    無時限機制 — 只要 entry 存在就生效，唯有本人購買項圈鑰匙才會被移除。"""
+    data = _load_bot_collars()
+    entry = data.get(_bot_collar_key(guild_id, user_id))
+    if not entry:
+        return None
+    p = entry.get('prompt') or ''
+    return p if p else None
+
+
 async def _get_or_create_pill_role(guild: discord.Guild) -> discord.Role | None:
     role = discord.utils.get(guild.roles, name=TRUTH_PILL_ROLE_NAME)
     if role is not None:
@@ -918,7 +1018,7 @@ async def _get_or_create_pill_role(guild: discord.Guild) -> discord.Role | None:
             permissions=discord.Permissions.none(),
             hoist=False,
             mentionable=False,
-            reason='shop: 真心話藥丸效果角色',
+            reason='shop: 調教項圈效果角色',
         )
     except discord.HTTPException as e:
         print(f'[PILL] 建立角色失敗 guild={guild.id}: {e}')
@@ -959,7 +1059,7 @@ async def _get_pill_webhook(channel: discord.abc.Messageable) -> tuple[discord.W
     try:
         wh = await parent.create_webhook(
             name=_PILL_WEBHOOK_NAME,
-            reason='shop: 真心話藥丸假冒重發',
+            reason='shop: 調教項圈假冒重發',
         )
     except discord.Forbidden:
         return None, thread
@@ -1020,8 +1120,8 @@ async def _purchase_truth_pill(
     """1. 驗證目標 → 2. 反轉牌偵測 → 3. 扣錢 → 4. 取/建效果角色 → 5. 套用 → 6. 寫 json。
 
     回 (success, error_msg, redirected)。redirected=True 表示 target 身懷反轉牌，
-    藥效反彈到 buyer 自己身上（反轉牌已消耗）。
-    撞號（已被別人餵過）→ 直接覆蓋 entry，前 buyer 不退款。
+    效果反彈到 buyer 自己身上（反轉牌已消耗）。
+    撞號（已被別人戴過）→ 直接覆蓋 entry，前 buyer 不退款。
     """
     target = guild.get_member(int(target_id))
     if target is None:
@@ -1068,7 +1168,7 @@ async def _purchase_truth_pill(
 
     try:
         if role not in final_target.roles:
-            await final_target.add_roles(role, reason='shop: 真心話藥丸效果套用')
+            await final_target.add_roles(role, reason='shop: 調教項圈效果套用')
     except discord.Forbidden:
         await _refund(buyer_uid, TRUTH_PILL_PRICE)
         return False, '❌ Bot 角色排序不夠高，無法為目標加身分組（已退款）', redirected
@@ -1093,9 +1193,9 @@ async def _purchase_truth_pill(
 
 
 async def maybe_apply_truth_pill(msg: discord.Message) -> bool:
-    """攔截被餵真心話藥丸的用戶訊息：刪除 → 背景 AI 改寫 → webhook 假冒重發。
+    """攔截被戴調教項圈的用戶訊息：刪除 → 背景 AI 改寫 → webhook 假冒重發。
 
-    觸發條件（role 為單一真相來源）：作者掛有 [商店:真心話藥丸] 身分組。
+    觸發條件（role 為單一真相來源）：作者掛有 [商店:調教項圈] 身分組。
     有 role 但 json entry 缺失（手動加的或資料遺失）→ 不處理，保留原訊息。
 
     回 True 表示已攔截，main.py 應 return 不再走後續流程；
@@ -1178,20 +1278,27 @@ async def _pill_rewrite_and_send(msg: discord.Message, entry: dict) -> None:
         print(f'[PILL] rewrite/send 例外: {type(e).__name__}: {e}')
 
 
-# ── 真心話藥丸 Embed + View + Modal ────────────────────────────────────
+# ── 調教項圈 Embed + View + Modal ────────────────────────────────────
 def _pill_embed(user: discord.abc.User) -> discord.Embed:
     uid     = str(user.id)
     balance = get_balance(uid)
     body = [
-        '**🛒 商品：真心話藥丸**',
+        '**🛒 商品：調教項圈**',
         '',
-        f'💊 **真心話藥丸** — `{TRUTH_PILL_PRICE:,}` 咕嚕喵碎片 / 顆',
-        f'　選一名目標，**{TRUTH_PILL_DURATION_HOURS} 小時內**他發的每句文字',
-        '　會被 AI 依你的指令竄改，並以他自己的名字 + 頭像重新發出。',
+        f'🦴 **戴在玩家身上** — `{TRUTH_PILL_PRICE:,}` 碎片 / 顆',
+        f'　{TRUTH_PILL_DURATION_HOURS} 小時內目標發的每句文字會被 AI 依你的指令竄改，',
+        '　並以他自己的名字 + 頭像重新發出。',
         '　可設定：**AI 改寫指令** + **句首** + **句尾**（至少填一項）',
-        f'　持續期間目標掛上 `{TRUTH_PILL_ROLE_NAME}` 身分組（觸發條件）',
-        '　撞號：後購買者覆蓋前者（前者不退款）',
-        '　限制：對機器人無效；目標的純圖片/貼圖訊息不竄改',
+        '　限制：對機器人無效；純圖片/貼圖不竄改',
+        '',
+        f'🦴 **戴在小龍喵身上** — `{TRUTH_PILL_PRICE:,}` 碎片 / 顆',
+        '　**無時限**：只對你自己的對話，小龍喵改用你寫的 prompt 回應，',
+        '　直到你本人購買項圈鑰匙才會還原預設。',
+        '　身分鑑別硬規則（真主人 ID / 不洩漏 ID）**不可覆蓋**。',
+        '　不影響其他玩家與小龍喵的互動。',
+        '',
+        f'🔑 **項圈鑰匙** — `{ANTIDOTE_PRICE:,}` 碎片（在「項圈鑰匙」分頁購買）',
+        '　玩家項圈：任何人都能解；小龍喵項圈：**只有戴上者本人能解**',
         '',
         f'目前餘額：**{balance:,}** 咕嚕喵碎片',
     ]
@@ -1218,14 +1325,35 @@ class TruthPillShopView(discord.ui.View):
         self.clear_items()
         balance = get_balance(self.uid)
         btn = discord.ui.Button(
-            label=f'選擇對象並設定 ({TRUTH_PILL_PRICE:,})',
-            emoji='💊',
+            label=f'戴在玩家身上 ({TRUTH_PILL_PRICE:,})',
+            emoji='🦴',
             style=discord.ButtonStyle.primary,
             disabled=balance < TRUTH_PILL_PRICE,
             row=0,
         )
         btn.callback = self._open_target_select
         self.add_item(btn)
+
+        bot_btn = discord.ui.Button(
+            label=f'戴在小龍喵身上 ({TRUTH_PILL_PRICE:,})',
+            emoji='🦴',
+            style=discord.ButtonStyle.primary,
+            disabled=balance < TRUTH_PILL_PRICE,
+            row=0,
+        )
+        bot_btn.callback = self._open_bot_modal
+        self.add_item(bot_btn)
+
+        # 項圈鑰匙從商店主頁移到這裡（作為「解項圈」的對應動作）
+        key_btn = discord.ui.Button(
+            label=f'購買項圈鑰匙 ({ANTIDOTE_PRICE:,})',
+            emoji='🔑',
+            style=discord.ButtonStyle.success,
+            disabled=balance < ANTIDOTE_PRICE,
+            row=1,
+        )
+        key_btn.callback = self._goto_antidote
+        self.add_item(key_btn)
 
         back = discord.ui.Button(
             label='⬅️ 返回商店',
@@ -1241,7 +1369,26 @@ class TruthPillShopView(discord.ui.View):
         self.button_interaction = interaction
         view = TruthPillTargetSelectView(self.uid, self.guild, parent_shop=self)
         await interaction.response.send_message(
-            '選擇要餵真心話藥丸的目標：', view=view, ephemeral=True,
+            '選擇要戴上調教項圈的目標：', view=view, ephemeral=True,
+        )
+
+    async def _open_bot_modal(self, interaction: discord.Interaction) -> None:
+        if str(interaction.user.id) != self.uid:
+            await interaction.response.send_message('這不是你的商店', ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            BotPersonaModal(self.uid, self.guild, parent_shop=self),
+        )
+
+    async def _goto_antidote(self, interaction: discord.Interaction) -> None:
+        if str(interaction.user.id) != self.uid:
+            await interaction.response.send_message('這不是你的商店', ephemeral=True)
+            return
+        view = AntidoteShopView(self.uid, self.guild,
+                                root_interaction=self.root_interaction,
+                                back_to_pill=True)
+        await interaction.response.edit_message(
+            embed=_antidote_embed(interaction.user), view=view,
         )
 
     async def _back_cb(self, interaction: discord.Interaction) -> None:
@@ -1272,7 +1419,7 @@ class TruthPillTargetSelectView(discord.ui.View):
             target = select.values[0]
             if getattr(target, 'bot', False):
                 await inter.response.send_message(
-                    '❌ 不能對機器人使用真心話藥丸', ephemeral=True,
+                    '❌ 不能對機器人使用調教項圈', ephemeral=True,
                 )
                 return
             await inter.response.send_modal(
@@ -1285,7 +1432,7 @@ class TruthPillTargetSelectView(discord.ui.View):
         self.add_item(select)
 
 
-class TruthPillModal(discord.ui.Modal, title='設定真心話藥丸竄改規則'):
+class TruthPillModal(discord.ui.Modal, title='設定調教項圈竄改規則'):
     prompt_input = discord.ui.TextInput(
         label='AI 改寫指令（可留空 → 不用 AI）',
         placeholder='例：把每句都變成自卑廢柴的內心戲',
@@ -1345,14 +1492,14 @@ class TruthPillModal(discord.ui.Modal, title='設定真心話藥丸竄改規則'
         buyer = interaction.user
         if redirected:
             announce = (
-                f'🪞 {buyer.mention} 想餵 <@{self.target_id}> 吃真心話藥丸，'
-                f'但被反轉牌反彈了！{buyer.mention} 自己吃下了真心話藥丸。\n'
-                f'藥效 {TRUTH_PILL_DURATION_HOURS}hr，可購買解藥提前解除。'
+                f'🪞 {buyer.mention} 想給 <@{self.target_id}> 戴上調教項圈，'
+                f'但被反轉牌反彈了！{buyer.mention} 自己戴上了調教項圈。\n'
+                f'效果 {TRUTH_PILL_DURATION_HOURS}hr，可購買項圈鑰匙提前解除。'
             )
         else:
             announce = (
-                f'💊 {buyer.mention} 餵 <@{self.target_id}> 吃下了真心話藥丸。\n'
-                f'藥效 {TRUTH_PILL_DURATION_HOURS}hr，可購買解藥提前解除。'
+                f'🦴 {buyer.mention} 給 <@{self.target_id}> 戴上了調教項圈。\n'
+                f'效果 {TRUTH_PILL_DURATION_HOURS}hr，可購買項圈鑰匙提前解除。'
             )
         try:
             await interaction.channel.send(
@@ -1371,22 +1518,88 @@ class TruthPillModal(discord.ui.Modal, title='設定真心話藥丸竄改規則'
                 pass
         try:
             await interaction.edit_original_response(
-                content='✅ 真心話藥丸已生效',
+                content='✅ 調教項圈已生效',
             )
         except discord.HTTPException:
             pass
         await _render_main_via_root(parent_shop.root_interaction)
 
 
-# ── 解藥 ────────────────────────────────────────────────────────────────
+class BotPersonaModal(discord.ui.Modal, title='給小龍喵戴上調教項圈'):
+    prompt_input = discord.ui.TextInput(
+        label='小龍喵 prompt 覆寫（只對你自己生效）',
+        placeholder='例：你要全程裝睡，只能講「喵...」之類的單字',
+        style=discord.TextStyle.paragraph,
+        min_length=1,
+        max_length=BOT_COLLAR_PROMPT_MAX,
+        required=True,
+    )
+
+    def __init__(self, uid: str, guild: discord.Guild,
+                 *, parent_shop: TruthPillShopView):
+        super().__init__()
+        self.uid = uid
+        self.guild = guild
+        self.parent_shop = parent_shop
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        prompt = (str(self.prompt_input.value) or '').strip()
+        if not prompt:
+            await interaction.response.send_message(
+                'prompt 不能空白', ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # 扣錢
+        ok, err, _ = await _atomic_deduct(self.uid, TRUTH_PILL_PRICE)
+        if not ok:
+            try:
+                await interaction.edit_original_response(content=err)
+            except discord.HTTPException:
+                pass
+            return
+
+        await _set_bot_collar(self.guild.id, int(self.uid), prompt)
+        print(f'[PILL] 小龍喵項圈 set buyer={self.uid} guild={self.guild.id} (permanent)')
+
+        announce = (
+            f'🦴 <@{int(self.uid)}> 給小龍喵戴上了調教項圈。\n'
+            f'**無時限**，只對 <@{int(self.uid)}> 自己生效；'
+            f'須由 <@{int(self.uid)}> 本人購買項圈鑰匙才能還原。'
+        )
+        try:
+            await interaction.channel.send(
+                announce,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException as e:
+            print(f'[PILL] 公告發送失敗: {e}')
+
+        try:
+            await interaction.edit_original_response(
+                content='✅ 已給小龍喵戴上項圈',
+            )
+        except discord.HTTPException:
+            pass
+        await _render_main_via_root(self.parent_shop.root_interaction)
+
+
+# ── 項圈鑰匙 ────────────────────────────────────────────────────────────────
 ANTIDOTE_PRICE = 10_000
 
 
 async def _use_antidote(guild: discord.Guild, buyer_uid: str,
                         target_id: int) -> tuple[bool, str, str]:
-    """1. 驗證目標 → 2. 確認中毒 → 3. 扣錢 → 4. 移除角色 → 5. 刪 entry。
+    """項圈鑰匙：
+      - 玩家項圈：任何人都能幫任何目標解（包含自救/救人）
+      - 小龍喵項圈：**只有戴上者本人能解**（buyer 必須 == target）
 
-    回 (success, error_msg, target_display_name)。
+    1. 驗證目標
+    2. 判斷實際能解的項目（player 全員可解；bot 限本人）
+    3. 扣錢
+    4. 移除
     """
     target = guild.get_member(int(target_id))
     if target is None:
@@ -1398,8 +1611,19 @@ async def _use_antidote(guild: discord.Guild, buyer_uid: str,
             return False, '❌ 無法取得該用戶資料', ''
 
     role = discord.utils.get(guild.roles, name=TRUTH_PILL_ROLE_NAME)
-    if role is None or role not in target.roles:
-        return False, f'❌ {target.display_name} 沒有中真心話藥丸毒，不需要解藥', target.display_name
+    has_player_collar = role is not None and role in target.roles
+    has_bot_collar    = bool(_load_bot_collars().get(_bot_collar_key(guild.id, int(target_id))))
+
+    is_self = (str(target_id) == str(buyer_uid))
+    can_remove_bot_collar = has_bot_collar and is_self
+
+    if not has_player_collar and not can_remove_bot_collar:
+        if has_bot_collar and not is_self:
+            return False, (
+                f'❌ {target.display_name} 的小龍喵項圈只有本人才能解；'
+                f'你能解的只有對方的玩家項圈（目前沒有）'
+            ), target.display_name
+        return False, f'❌ {target.display_name} 沒有戴調教項圈，不需要項圈鑰匙', target.display_name
 
     if get_balance(buyer_uid) < ANTIDOTE_PRICE:
         return False, f'❌ 餘額不足，需要 {ANTIDOTE_PRICE:,}（你有 {get_balance(buyer_uid):,}）', target.display_name
@@ -1408,17 +1632,24 @@ async def _use_antidote(guild: discord.Guild, buyer_uid: str,
     if not ok:
         return False, err, target.display_name
 
-    try:
-        await target.remove_roles(role, reason='shop: 解藥使用')
-    except discord.Forbidden:
-        await _refund(buyer_uid, ANTIDOTE_PRICE)
-        return False, '❌ Bot 角色排序不夠高，無法移除（已退款）', target.display_name
-    except discord.HTTPException as e:
-        await _refund(buyer_uid, ANTIDOTE_PRICE)
-        return False, f'❌ Discord 拒絕請求：{e}（已退款）', target.display_name
+    # 移除玩家項圈（如果有）
+    if has_player_collar:
+        try:
+            await target.remove_roles(role, reason='shop: 項圈鑰匙使用')
+        except discord.Forbidden:
+            await _refund(buyer_uid, ANTIDOTE_PRICE)
+            return False, '❌ Bot 角色排序不夠高，無法移除（已退款）', target.display_name
+        except discord.HTTPException as e:
+            await _refund(buyer_uid, ANTIDOTE_PRICE)
+            return False, f'❌ Discord 拒絕請求：{e}（已退款）', target.display_name
+        await _drop_pill_entry(guild.id, int(target_id))
 
-    await _drop_pill_entry(guild.id, int(target_id))
-    print(f'[PILL] 解藥使用 buyer={buyer_uid} target={target_id} guild={guild.id}')
+    # 移除小龍喵項圈（只在本人購買時）
+    if can_remove_bot_collar:
+        await _drop_bot_collar(guild.id, int(target_id))
+
+    print(f'[PILL] 項圈鑰匙使用 buyer={buyer_uid} target={target_id} guild={guild.id} '
+          f'player_collar={has_player_collar} bot_collar={can_remove_bot_collar}')
     return True, '', target.display_name
 
 
@@ -1426,12 +1657,13 @@ def _antidote_embed(user: discord.abc.User) -> discord.Embed:
     uid     = str(user.id)
     balance = get_balance(uid)
     body = [
-        '**🛒 商品：解藥**',
+        '**🛒 商品：項圈鑰匙**',
         '',
-        f'💉 **解藥** — `{ANTIDOTE_PRICE:,}` 咕嚕喵碎片 / 劑',
-        f'　移除目標的 `{TRUTH_PILL_ROLE_NAME}` 身分組',
-        '　→ 真心話藥丸效果立即解除',
-        '　可對任何人使用（自救或救人），目標必須正在發作中',
+        f'🔑 **項圈鑰匙** — `{ANTIDOTE_PRICE:,}` 咕嚕喵碎片 / 劑',
+        '　可解除：',
+        f'　・**玩家項圈**（移除 `{TRUTH_PILL_ROLE_NAME}` 身分組）— 任何人能對任何目標使用',
+        '　・**小龍喵項圈**（清除 prompt 覆寫）— **只有戴上者本人能解自己的**',
+        '　target 自己購買可同時解除兩種；他人購買只能解 target 的玩家項圈',
         '',
         f'目前餘額：**{balance:,}** 咕嚕喵碎片',
     ]
@@ -1446,14 +1678,16 @@ def _antidote_embed(user: discord.abc.User) -> discord.Embed:
 
 class AntidoteShopView(discord.ui.View):
     def __init__(self, uid: str, guild: discord.Guild,
-                 *, root_interaction: discord.Interaction):
+                 *, root_interaction: discord.Interaction,
+                 back_to_pill: bool = False):
         super().__init__(timeout=300)
         self.uid              = uid
         self.guild            = guild
         self.root_interaction = root_interaction
+        self.back_to_pill     = back_to_pill
 
         select = discord.ui.UserSelect(
-            placeholder='選擇要解毒的目標（可選自己）',
+            placeholder='選擇要解鎖項圈的目標（可選自己）',
             min_values=1,
             max_values=1,
             row=0,
@@ -1466,7 +1700,7 @@ class AntidoteShopView(discord.ui.View):
             target = select.values[0]
             if getattr(target, 'bot', False):
                 await inter.response.send_message(
-                    '❌ 機器人不會中毒喵', ephemeral=True,
+                    '❌ 機器人不需要戴項圈喵', ephemeral=True,
                 )
                 return
             if get_balance(self.uid) < ANTIDOTE_PRICE:
@@ -1486,19 +1720,19 @@ class AntidoteShopView(discord.ui.View):
                     pass
                 return
             if int(target.id) == int(self.uid):
-                announce = f'💉 {inter.user.mention} 已購買解藥解除負面效果'
+                announce = f'🔑 {inter.user.mention} 用項圈鑰匙解開了自己的項圈'
             else:
-                announce = f'💉 {inter.user.mention} 已購買解藥給 <@{int(target.id)}>'
+                announce = f'🔑 {inter.user.mention} 用項圈鑰匙解開了 <@{int(target.id)}> 的項圈'
             try:
                 await inter.channel.send(
                     announce,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
             except discord.HTTPException as e:
-                print(f'[PILL] 解藥公告發送失敗: {e}')
+                print(f'[PILL] 項圈鑰匙公告發送失敗: {e}')
 
             try:
-                await inter.edit_original_response(content='✅ 解藥已使用')
+                await inter.edit_original_response(content='✅ 項圈鑰匙已使用')
             except discord.HTTPException:
                 pass
             await _render_main_via_root(self.root_interaction)
@@ -1507,7 +1741,7 @@ class AntidoteShopView(discord.ui.View):
         self.add_item(select)
 
         back = discord.ui.Button(
-            label='⬅️ 返回商店',
+            label='⬅️ 返回調教項圈' if self.back_to_pill else '⬅️ 返回商店',
             style=discord.ButtonStyle.secondary, row=1,
         )
 
@@ -1515,13 +1749,20 @@ class AntidoteShopView(discord.ui.View):
             if str(inter.user.id) != self.uid:
                 await inter.response.send_message('這不是你的商店', ephemeral=True)
                 return
-            await _render_main_via_edit(inter, self.root_interaction)
+            if self.back_to_pill:
+                pill_view = TruthPillShopView(self.uid, self.guild,
+                                              root_interaction=self.root_interaction)
+                await inter.response.edit_message(
+                    embed=_pill_embed(inter.user), view=pill_view,
+                )
+            else:
+                await _render_main_via_edit(inter, self.root_interaction)
 
         back.callback = _back
         self.add_item(back)
 
 
-# ── 背景任務：真心話藥丸到期回收 ──────────────────────────────────────
+# ── 背景任務：調教項圈到期回收 ──────────────────────────────────────
 async def _pill_expire_once(client: discord.Client) -> None:
     data = _load_pills()
     if not data:
@@ -1542,14 +1783,40 @@ async def _pill_expire_once(client: discord.Client) -> None:
             role   = guild.get_role(int(entry.get('role_id', 0)))
             if target is not None and role is not None and role in target.roles:
                 try:
-                    await target.remove_roles(role, reason='shop: 真心話藥丸到期')
+                    await target.remove_roles(role, reason='shop: 調教項圈到期')
                 except discord.HTTPException as e:
                     print(f'[PILL] 移除角色失敗 guild={guild.id} target={target.id}: {e}')
         data.pop(key, None)
         removed += 1
     if removed > 0:
         await _save_pills(data)
-        print(f'[PILL] 到期回收 {removed} 個藥效')
+        print(f'[PILL] 到期回收 {removed} 個項圈')
+
+
+async def _bot_collar_expire_once() -> None:
+    """小龍喵項圈現在是**無時限**，須本人購買項圈鑰匙才能解。
+    這個 task 只清理舊版本（有 expires_at 且已過期）資料，向後相容。"""
+    data = _load_bot_collars()
+    if not data:
+        return
+    now = datetime.now()
+    removed = 0
+    for key, entry in list(data.items()):
+        exp_str = entry.get('expires_at')
+        if not exp_str:
+            # 新版無時限 entry：保留
+            continue
+        try:
+            exp = datetime.fromisoformat(exp_str)
+        except ValueError:
+            # 格式壞掉 — 不亂刪，保留供人工檢查
+            continue
+        if exp <= now:
+            data.pop(key, None)
+            removed += 1
+    if removed > 0:
+        await _save_bot_collars(data)
+        print(f'[PILL] 小龍喵項圈（舊版本到期）回收 {removed} 個')
 
 
 async def _pill_expire_loop(client: discord.Client) -> None:
@@ -1557,6 +1824,7 @@ async def _pill_expire_loop(client: discord.Client) -> None:
         await asyncio.sleep(_ROLE_CHECK_INTERVAL)
         try:
             await _pill_expire_once(client)
+            await _bot_collar_expire_once()
         except Exception as e:
             print(f'[PILL] expire loop error: {e}')
 
@@ -1691,6 +1959,1257 @@ class NicknameModal(discord.ui.Modal, title='設定 AI 聊天自訂名稱'):
         await _render_main_via_root(self.root_interaction)
 
 
+# ── 販售 / 贈禮 共用 helpers ───────────────────────────────────────────
+# 礦工 / 反轉牌的「半價賣」 — fishing.py 自己管釣竿/魚餌/魚的賣價
+MINER_SELL_PRICE = MINER_PRICE // 2          # 50,000
+REVERSE_SELL_PRICE = REVERSE_CARD_PRICE // 2  # 15,000
+
+
+async def _atomic_sell_miner(uid: str, n: int) -> tuple[bool, str, int]:
+    """礦工 -n，餘額 +n*MINER_SELL_PRICE。原子寫入。"""
+    if n <= 0:
+        return False, '數量必須為正', 0
+    data  = load_json(_WALLET_FILE)
+    users = data.setdefault('users', {})
+    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+    cur_miners = int(rec.get('miners', 0))
+    if cur_miners < n:
+        return False, f'礦工不足（持有 {cur_miners}）', 0
+    gain = MINER_SELL_PRICE * n
+    rec['miners']  = cur_miners - n
+    rec['balance'] = int(rec.get('balance', 0)) + gain
+    await save_json_async(_WALLET_FILE, data)
+    return True, '', gain
+
+
+async def _atomic_sell_reverse(uid: str, n: int) -> tuple[bool, str, int]:
+    if n <= 0:
+        return False, '數量必須為正', 0
+    data  = load_json(_WALLET_FILE)
+    users = data.setdefault('users', {})
+    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+    cur = int(rec.get('reverse_cards', 0))
+    if cur < n:
+        return False, f'反轉牌不足（持有 {cur}）', 0
+    gain = REVERSE_SELL_PRICE * n
+    rec['reverse_cards'] = cur - n
+    rec['balance'] = int(rec.get('balance', 0)) + gain
+    await save_json_async(_WALLET_FILE, data)
+    return True, '', gain
+
+
+async def _atomic_transfer_reverse(from_uid: str, to_uid: str, n: int = 1) -> tuple[bool, str]:
+    """贈禮反轉牌時用：from 扣 → to 加。to 已有達到上限則 from 補回（呼叫端處理退回）。"""
+    if n <= 0:
+        return False, '數量必須為正'
+    data  = load_json(_WALLET_FILE)
+    users = data.setdefault('users', {})
+    src   = users.setdefault(from_uid, dict(_DEFAULT_REC))
+    dst   = users.setdefault(to_uid,   dict(_DEFAULT_REC))
+    if int(src.get('reverse_cards', 0)) < n:
+        return False, '贈禮者反轉牌不足'
+    if int(dst.get('reverse_cards', 0)) + n > REVERSE_CARD_MAX:
+        return False, f'對方反轉牌已滿（上限 {REVERSE_CARD_MAX}）'
+    src['reverse_cards'] = int(src['reverse_cards']) - n
+    dst['reverse_cards'] = int(dst.get('reverse_cards', 0)) + n
+    await save_json_async(_WALLET_FILE, data)
+    return True, ''
+
+
+def _has_reverse(uid: str) -> int:
+    return int(load_json(_WALLET_FILE).get('users', {}).get(uid, {}).get('reverse_cards', 0))
+
+
+async def _atomic_transfer_miner(from_uid: str, to_uid: str, n: int = 1) -> tuple[bool, str]:
+    """贈禮礦工：from 扣 → to 加。to 達上限則拒絕。"""
+    if n <= 0:
+        return False, '數量必須為正'
+    data  = load_json(_WALLET_FILE)
+    users = data.setdefault('users', {})
+    src   = users.setdefault(from_uid, dict(_DEFAULT_REC))
+    dst   = users.setdefault(to_uid,   dict(_DEFAULT_REC))
+    if int(src.get('miners', 0)) < n:
+        return False, '贈禮者礦工不足'
+    if int(dst.get('miners', 0)) + n > MINER_CAP:
+        return False, f'對方礦工已達上限 {MINER_CAP} 台'
+    src['miners'] = int(src['miners']) - n
+    dst['miners'] = int(dst.get('miners', 0)) + n
+    await save_json_async(_WALLET_FILE, data)
+    return True, ''
+
+
+# ── 販售 View（多分類） ─────────────────────────────────────────────────
+# ── 釣魚用品（轉接到 fishing 的 RodShopView / BaitShopView）─────────────
+class ShopFishingEquipView(discord.ui.View):
+    """從 /shop 或 /fishing 進入釣魚用品的轉接面板。
+    內容與商店「釣魚用品」相同；back_to_fishing_main=True 時返回鈕回 /fishing 主面板。"""
+
+    def __init__(self, uid: str, *, root_interaction: discord.Interaction,
+                 back_to_fishing_main: bool = False):
+        super().__init__(timeout=300)
+        self.uid = uid
+        self.root_interaction = root_interaction
+        self.back_to_fishing_main = back_to_fishing_main
+        self._build()
+
+    def build_embed(self, user: discord.abc.User) -> discord.Embed:
+        from commands import fishing as F
+        cap = F.get_fish_pond_cap(self.uid)
+        fish_total = F.get_fish_count_total(self.uid)
+        lines = [
+            '**🎣 釣竿** — 永久裝備，等級越高時長越短 / 特殊變體機率越高',
+            '**🪱 魚餌** — 消耗品，影響稀有度分佈',
+            f'**📦 擴充保溫箱** — `{F.FISH_POND_EXPAND_COST:,}` 碎片 / 次（+{F.FISH_POND_EXPAND_STEP} 格）',
+            f'　目前保溫箱：**{fish_total} / {cap}** 條',
+            '',
+            f'**🧪 幸運藥水Ⅰ** — `{F.LUCK_POTION_I_PRICE:,}` / {F.POTION_DURATION_MIN}分（釣魚時間 -{int(F.LUCK_POTION_I_REDUCE*100)}%）',
+            f'**🍀 幸運藥水Ⅱ** — `{F.LUCK_POTION_II_PRICE:,}` / {F.POTION_DURATION_MIN}分（罕見以上機率 +{F.LUCK_POTION_II_LUCK} luck）',
+            f'**✨ 幸運藥水Ⅲ** — `{F.LUCK_POTION_III_PRICE:,}` / {F.POTION_DURATION_MIN}分（提升釣到特殊變體魚的機率）',
+            f'**📡 物種雷達**   — `{F.RADAR_PRICE:,}` / {F.POTION_DURATION_MIN}分（沒釣過物種偏好 +{int(F.RADAR_UNSEEN_BIAS*100)}%）',
+            f'_藥水Ⅰ、Ⅱ 互斥；各項累計上限 {F.POTION_STACK_CAP_MIN // 60} 小時_',
+        ]
+        # 目前 buff 狀態
+        buff_line = F._buff_status_line(self.uid)
+        if buff_line:
+            lines += ['', f'**目前生效：** {buff_line}']
+        lines += ['', f'💰 餘額：**{get_balance(self.uid):,}** 咕嚕喵碎片']
+        return discord.Embed(
+            title='🛒 商品：釣魚用品',
+            description='\n'.join(lines),
+            color=discord.Color.blurple(),
+        )
+
+    def _build(self) -> None:
+        from commands import fishing as F
+        # Row 0: 釣竿 / 魚餌 / 擴充
+        rod = discord.ui.Button(
+            label='🎣 購買釣竿', style=discord.ButtonStyle.primary, row=0,
+        )
+        rod.callback = self._goto_rod
+        self.add_item(rod)
+
+        bait = discord.ui.Button(
+            label='🪱 購買魚餌', style=discord.ButtonStyle.primary, row=0,
+        )
+        bait.callback = self._goto_bait
+        self.add_item(bait)
+
+        expand_btn = discord.ui.Button(
+            label=f'📦 擴充保溫箱 ({F.FISH_POND_EXPAND_COST:,})',
+            style=discord.ButtonStyle.success, row=0,
+            disabled=(get_balance(self.uid) < F.FISH_POND_EXPAND_COST),
+        )
+        expand_btn.callback = self._expand_pond
+        self.add_item(expand_btn)
+
+        # Row 1: 三個 buff 商品
+        balance = get_balance(self.uid)
+        p1_btn = discord.ui.Button(
+            label=f'🧪 幸運藥水Ⅰ ({F.LUCK_POTION_I_PRICE:,})',
+            style=discord.ButtonStyle.primary, row=1,
+            disabled=(balance < F.LUCK_POTION_I_PRICE),
+        )
+        p1_btn.callback = self._buy_p1
+        self.add_item(p1_btn)
+
+        p2_btn = discord.ui.Button(
+            label=f'🍀 幸運藥水Ⅱ ({F.LUCK_POTION_II_PRICE:,})',
+            style=discord.ButtonStyle.primary, row=1,
+            disabled=(balance < F.LUCK_POTION_II_PRICE),
+        )
+        p2_btn.callback = self._buy_p2
+        self.add_item(p2_btn)
+
+        p3_btn = discord.ui.Button(
+            label=f'✨ 幸運藥水Ⅲ ({F.LUCK_POTION_III_PRICE:,})',
+            style=discord.ButtonStyle.primary, row=1,
+            disabled=(balance < F.LUCK_POTION_III_PRICE),
+        )
+        p3_btn.callback = self._buy_p3
+        self.add_item(p3_btn)
+
+        # Row 2: 雷達 + 前往釣魚 / 返回商店
+        radar_btn = discord.ui.Button(
+            label=f'📡 物種雷達 ({F.RADAR_PRICE:,})',
+            style=discord.ButtonStyle.primary, row=2,
+            disabled=(balance < F.RADAR_PRICE),
+        )
+        radar_btn.callback = self._buy_radar
+        self.add_item(radar_btn)
+
+        if not self.back_to_fishing_main:
+            go_fish = discord.ui.Button(
+                label='🎣 前往釣魚', style=discord.ButtonStyle.success, row=2,
+            )
+            go_fish.callback = self._goto_fishing
+            self.add_item(go_fish)
+
+        back_label = '⬅️ 返回釣魚主面板' if self.back_to_fishing_main else '⬅️ 返回商店'
+        back = discord.ui.Button(
+            label=back_label, style=discord.ButtonStyle.secondary, row=2,
+        )
+        back.callback = self._back
+        self.add_item(back)
+
+    async def _check(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) != self.uid:
+            await interaction.response.send_message('這不是你的商店', ephemeral=True)
+            return False
+        return True
+
+    async def _goto_rod(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        from commands import fishing as F
+        view = F.RodShopView(self.uid, self.root_interaction,
+                             back_to_shop_equip=True,
+                             back_to_fishing_main=self.back_to_fishing_main)
+        await interaction.response.edit_message(
+            embed=view.build_embed(interaction.user), view=view,
+        )
+
+    async def _goto_bait(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        from commands import fishing as F
+        view = F.BaitShopView(self.uid, self.root_interaction, page=0,
+                              back_to_shop_equip=True,
+                              back_to_fishing_main=self.back_to_fishing_main)
+        await interaction.response.edit_message(
+            embed=view.build_embed(interaction.user), view=view,
+        )
+
+    async def _expand_pond(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        from commands import fishing as F
+        ok, err, new_cap = await F.expand_fish_pond(self.uid)
+        # 重建本頁顯示
+        new = ShopFishingEquipView(self.uid, root_interaction=self.root_interaction)
+        await interaction.response.edit_message(
+            embed=new.build_embed(interaction.user), view=new,
+        )
+        msg = (f'✅ 已擴充保溫箱，目前上限 **{new_cap}** 條'
+               if ok else f'❌ {err}')
+        try:
+            await interaction.followup.send(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+    async def _refresh_and_toast(self, interaction: discord.Interaction,
+                                  ok: bool, err: str, exp, label: str) -> None:
+        new = ShopFishingEquipView(self.uid, root_interaction=self.root_interaction)
+        await interaction.response.edit_message(
+            embed=new.build_embed(interaction.user), view=new,
+        )
+        if ok:
+            ts = f'<t:{int(exp.timestamp())}:R>' if exp else ''
+            msg = f'✅ 已購買 {label}，到期 {ts}'
+        else:
+            msg = f'❌ {err}'
+        try:
+            await interaction.followup.send(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+    async def _buy_p1(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        from commands import fishing as F
+        ok, err, exp = await F.buy_luck_potion(self.uid, 'i')
+        await self._refresh_and_toast(interaction, ok, err, exp, '🧪 幸運藥水Ⅰ')
+
+    async def _buy_p2(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        from commands import fishing as F
+        ok, err, exp = await F.buy_luck_potion(self.uid, 'ii')
+        await self._refresh_and_toast(interaction, ok, err, exp, '🍀 幸運藥水Ⅱ')
+
+    async def _buy_p3(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        from commands import fishing as F
+        ok, err, exp = await F.buy_luck_potion_iii(self.uid)
+        await self._refresh_and_toast(interaction, ok, err, exp, '✨ 幸運藥水Ⅲ')
+
+    async def _buy_radar(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        from commands import fishing as F
+        ok, err, exp = await F.buy_radar(self.uid)
+        await self._refresh_and_toast(interaction, ok, err, exp, '📡 物種雷達')
+
+    async def _goto_fishing(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        from commands import fishing as F
+        view = F.FishingMainView(self.uid, self.root_interaction)
+        await interaction.response.edit_message(
+            embed=F._main_embed(interaction.user), view=view,
+        )
+
+    async def _back(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        if self.back_to_fishing_main:
+            from commands import fishing as F
+            view = F.FishingMainView(self.uid, self.root_interaction)
+            await interaction.response.edit_message(
+                embed=F._main_embed(interaction.user), view=view,
+            )
+        else:
+            await _render_main_via_edit(interaction, self.root_interaction)
+
+
+class SellMainView(discord.ui.View):
+    """販售主分類：釣竿 / 魚餌 / 保溫箱魚類 / 其他道具。"""
+
+    def __init__(self, uid: str, *, root_interaction: discord.Interaction):
+        super().__init__(timeout=300)
+        self.uid = uid
+        self.root_interaction = root_interaction
+        self._build()
+
+    def build_embed(self, user: discord.abc.User) -> discord.Embed:
+        # lazy import 避開 fishing 與 shop 互相 import 的循環風險
+        from commands import fishing as F
+        rods = list(F.get_rods(self.uid))
+        baits = F.get_baits(self.uid)
+        fish_total = F.get_fish_count_total(self.uid)
+        miners = _get_miners(self.uid)
+        rev = _has_reverse(self.uid)
+        lines = [
+            '**💸 販售 — 把多餘的道具/魚換成碎片**',
+            '',
+            '- 魚類：以隨機售價（min~max）原價賣',
+            '- 釣竿 / 魚餌 / 礦工 / 反轉牌：以原售價的 **半價** 賣',
+            '',
+            f'🎣 可賣釣竿：**{len(rods)}** 支',
+            f'🪱 可賣魚餌：**{sum(int(v) for v in baits.values())}** 個',
+            f'🐟 保溫箱魚類：**{fish_total}** 條',
+            f'⛏️ 礦工：**{miners}** 台　🪞 反轉牌：**{rev}** 張',
+            '',
+            f'💰 目前餘額：**{get_balance(self.uid):,}** 碎片',
+        ]
+        return discord.Embed(
+            title='🛒 商店',
+            description='\n'.join(lines),
+            color=discord.Color.blurple(),
+        )
+
+    def _build(self) -> None:
+        for label, cat, row in [
+            ('🎣 釣竿', 'rod',  0),
+            ('🪱 魚餌', 'bait', 0),
+            ('🐟 保溫箱魚類', 'fish', 0),
+            ('🎴 其他道具', 'misc', 1),
+        ]:
+            b = discord.ui.Button(label=label, style=discord.ButtonStyle.primary, row=row)
+            b.callback = self._make_goto(cat)
+            self.add_item(b)
+        back = discord.ui.Button(label='⬅️ 返回商店',
+                                 style=discord.ButtonStyle.secondary, row=2)
+        back.callback = self._back
+        self.add_item(back)
+
+    async def _check(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) != self.uid:
+            await interaction.response.send_message('這不是你的商店', ephemeral=True)
+            return False
+        return True
+
+    def _make_goto(self, cat: str):
+        async def _cb(interaction: discord.Interaction) -> None:
+            if not await self._check(interaction):
+                return
+            if cat == 'rod':
+                view = SellRodsView(self.uid, root_interaction=self.root_interaction)
+            elif cat == 'bait':
+                view = SellBaitsView(self.uid, root_interaction=self.root_interaction)
+            elif cat == 'fish':
+                view = SellFishView(self.uid, root_interaction=self.root_interaction)
+            else:
+                view = SellMiscView(self.uid, root_interaction=self.root_interaction)
+            await interaction.response.edit_message(
+                embed=view.build_embed(interaction.user), view=view,
+            )
+        return _cb
+
+    async def _back(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        await _render_main_via_edit(interaction, self.root_interaction)
+
+
+class _SellSubViewBase(discord.ui.View):
+    """販售子分類共用基類：提供 _check_owner / _back_to_sell。"""
+
+    def __init__(self, uid: str, root_interaction: discord.Interaction):
+        super().__init__(timeout=300)
+        self.uid = uid
+        self.root_interaction = root_interaction
+
+    async def _check(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) != self.uid:
+            await interaction.response.send_message('這不是你的商店', ephemeral=True)
+            return False
+        return True
+
+    async def _back_to_sell(self, interaction: discord.Interaction) -> None:
+        view = SellMainView(self.uid, root_interaction=self.root_interaction)
+        await interaction.response.edit_message(
+            embed=view.build_embed(interaction.user), view=view,
+        )
+
+
+class SellRodsView(_SellSubViewBase):
+    def __init__(self, uid: str, *, root_interaction: discord.Interaction):
+        super().__init__(uid, root_interaction)
+        self._build()
+
+    def build_embed(self, user: discord.abc.User) -> discord.Embed:
+        from commands import fishing as F
+        rods = list(F.get_rods(self.uid))
+        if not rods:
+            desc = '_(目前沒有可販售的釣竿)_'
+        else:
+            lines = []
+            for r in rods:
+                spec = F.ROD_SPECS[r]
+                lines.append(f'**T{spec["tier"]} {spec["name"]}** — 售價 `{F.rod_sell_price(r):,}` 碎片')
+            desc = '\n'.join(lines)
+        return discord.Embed(
+            title='🛒 販售 — 釣竿',
+            description=desc + f'\n\n💰 餘額：**{get_balance(self.uid):,}** 碎片',
+            color=discord.Color.blurple(),
+        )
+
+    def _build(self) -> None:
+        from commands import fishing as F
+        rods = list(F.get_rods(self.uid))
+        options: list[discord.SelectOption] = []
+        for r in rods:
+            spec = F.ROD_SPECS[r]
+            options.append(discord.SelectOption(
+                label=f'T{spec["tier"]} {spec["name"]}',
+                description=f'售價 {F.rod_sell_price(r):,}',
+                value=r,
+            ))
+        if options:
+            sel = discord.ui.Select(
+                placeholder='選擇要販售的釣竿',
+                options=options, min_values=1, max_values=1, row=0,
+            )
+            sel.callback = self._on_sell
+            self.add_item(sel)
+        back = discord.ui.Button(label='⬅️ 返回販售', style=discord.ButtonStyle.secondary, row=1)
+        back.callback = self._back_to_sell
+        self.add_item(back)
+
+    async def _on_sell(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        from commands import fishing as F
+        rod_key = interaction.data['values'][0]
+        ok, err, gain = await F.sell_rod(self.uid, rod_key)
+        new = SellRodsView(self.uid, root_interaction=self.root_interaction)
+        await interaction.response.edit_message(
+            embed=new.build_embed(interaction.user), view=new,
+        )
+        msg = f'✅ 已賣出 **{F.ROD_SPECS[rod_key]["name"]}**，獲得 `{gain:,}` 碎片' if ok else f'❌ {err}'
+        try:
+            await interaction.followup.send(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+
+class SellBaitsView(_SellSubViewBase):
+    def __init__(self, uid: str, *, root_interaction: discord.Interaction):
+        super().__init__(uid, root_interaction)
+        self._build()
+
+    def build_embed(self, user: discord.abc.User) -> discord.Embed:
+        from commands import fishing as F
+        baits = F.get_baits(self.uid)
+        if not baits:
+            desc = '_(目前沒有可販售的魚餌)_'
+        else:
+            lines = []
+            for k, n in sorted(baits.items(), key=lambda kv: F.BAIT_SPECS.get(kv[0], {}).get('price', 0)):
+                bs = F.BAIT_SPECS.get(k)
+                if bs is None or int(n) <= 0:
+                    continue
+                lines.append(
+                    f'🪱 **{bs["name"]}** × {n} — 單價 `{F.bait_sell_price(k):,}` 碎片'
+                )
+            desc = '\n'.join(lines) or '_(目前沒有可販售的魚餌)_'
+        return discord.Embed(
+            title='🛒 販售 — 魚餌',
+            description=desc + f'\n\n💰 餘額：**{get_balance(self.uid):,}** 碎片',
+            color=discord.Color.blurple(),
+        )
+
+    def _build(self) -> None:
+        from commands import fishing as F
+        baits = F.get_baits(self.uid)
+        options: list[discord.SelectOption] = []
+        for k, n in sorted(baits.items(), key=lambda kv: F.BAIT_SPECS.get(kv[0], {}).get('price', 0)):
+            bs = F.BAIT_SPECS.get(k)
+            if bs is None or int(n) <= 0:
+                continue
+            options.append(discord.SelectOption(
+                label=f'{bs["name"]} × {n}',
+                description=f'單價 {F.bait_sell_price(k):,}',
+                value=k,
+            ))
+        if options:
+            sel = discord.ui.Select(
+                placeholder='選擇要販售的魚餌',
+                options=options[:25], min_values=1, max_values=1, row=0,
+            )
+            sel.callback = self._on_pick
+            self.add_item(sel)
+        back = discord.ui.Button(label='⬅️ 返回販售', style=discord.ButtonStyle.secondary, row=1)
+        back.callback = self._back_to_sell
+        self.add_item(back)
+
+    async def _on_pick(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        key = interaction.data['values'][0]
+        await interaction.response.send_modal(
+            _SellQtyModal(self.uid, self.root_interaction,
+                          mode='bait', key=key, parent='bait'),
+        )
+
+
+class SellFishView(_SellSubViewBase):
+    def __init__(self, uid: str, *, root_interaction: discord.Interaction, page: int = 0):
+        super().__init__(uid, root_interaction)
+        self.page = page
+        from commands import fishing as F
+        self._owned = sorted(
+            ((k, int(v)) for k, v in F.get_fish(self.uid).items() if int(v) > 0),
+            key=lambda kv: (
+                list(F.RARITIES).index(F.FISH_SPECS[kv[0]]['rarity']),
+                kv[0],
+            ),
+        )
+        self._page_size = 20
+        self.total_pages = max(1, (len(self._owned) + self._page_size - 1) // self._page_size)
+        self._build()
+
+    def build_embed(self, user: discord.abc.User) -> discord.Embed:
+        from commands import fishing as F
+        if not self._owned:
+            desc = '_(保溫箱裡沒有任何魚)_'
+        else:
+            start = self.page * self._page_size
+            slice_ = self._owned[start:start + self._page_size]
+            lines = []
+            for k, n in slice_:
+                spec = F.FISH_SPECS[k]
+                lines.append(
+                    f'{F.RARITY_EMOJI[spec["rarity"]]} **{spec["name"]}** × {n} '
+                    f'(${spec["price"]:,}/條)'
+                )
+            desc = '\n'.join(lines)
+        return discord.Embed(
+            title=f'🛒 販售 — 保溫箱 ({self.page + 1}/{self.total_pages})',
+            description=desc + f'\n\n💰 餘額：**{get_balance(self.uid):,}** 碎片',
+            color=discord.Color.blurple(),
+        )
+
+    def _build(self) -> None:
+        from commands import fishing as F
+        start = self.page * self._page_size
+        slice_ = self._owned[start:start + self._page_size]
+        options: list[discord.SelectOption] = []
+        for k, n in slice_:
+            spec = F.FISH_SPECS[k]
+            options.append(discord.SelectOption(
+                label=f'{spec["name"]} × {n}',
+                description=f'{F.RARITY_LABEL[spec["rarity"]]} | ${spec["price"]:,}/條',
+                value=k,
+            ))
+        if options:
+            sel = discord.ui.Select(
+                placeholder='選擇要販售的魚',
+                options=options[:25], min_values=1, max_values=1, row=0,
+            )
+            sel.callback = self._on_pick
+            self.add_item(sel)
+
+        # 批量出售按鈕（rarity 全賣）
+        for label, rarity, row in [
+            ('全賣垃圾', 'trash', 1),
+            ('全賣普通', 'common', 1),
+            ('全賣罕見', 'rare', 1),
+            ('全賣史詩', 'epic', 2),
+            ('全賣傳說', 'legendary', 2),
+        ]:
+            b = discord.ui.Button(label=label, style=discord.ButtonStyle.danger, row=row)
+            b.callback = self._make_bulk(rarity)
+            self.add_item(b)
+
+        all_btn = discord.ui.Button(label='💸 全賣全部', style=discord.ButtonStyle.danger, row=2)
+        all_btn.callback = self._sell_all
+        self.add_item(all_btn)
+
+        custom_btn = discord.ui.Button(label='🎯 自訂多選',
+                                       style=discord.ButtonStyle.primary,
+                                       disabled=(not self._owned), row=2)
+        custom_btn.callback = self._open_custom
+        self.add_item(custom_btn)
+
+        # 分頁
+        if self.total_pages > 1:
+            prev_btn = discord.ui.Button(
+                label='◀️', style=discord.ButtonStyle.secondary,
+                disabled=(self.page <= 0), row=3,
+            )
+            prev_btn.callback = self._prev
+            self.add_item(prev_btn)
+            next_btn = discord.ui.Button(
+                label='▶️', style=discord.ButtonStyle.secondary,
+                disabled=(self.page >= self.total_pages - 1), row=3,
+            )
+            next_btn.callback = self._next
+            self.add_item(next_btn)
+
+        back = discord.ui.Button(label='⬅️ 返回販售', style=discord.ButtonStyle.secondary, row=3)
+        back.callback = self._back_to_sell
+        self.add_item(back)
+
+    async def _on_pick(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        key = interaction.data['values'][0]
+        await interaction.response.send_modal(
+            _SellQtyModal(self.uid, self.root_interaction,
+                          mode='fish', key=key, parent='fish'),
+        )
+
+    def _make_bulk(self, rarity: str):
+        async def _cb(interaction: discord.Interaction) -> None:
+            if not await self._check(interaction):
+                return
+            from commands import fishing as F
+            count, total = await F.sell_all_fish_by_rarity(self.uid, rarity)
+            new = SellFishView(self.uid, root_interaction=self.root_interaction)
+            await interaction.response.edit_message(
+                embed=new.build_embed(interaction.user), view=new,
+            )
+            try:
+                if count > 0:
+                    await interaction.followup.send(
+                        f'✅ 已賣出 **{count}** 條【{F.RARITY_LABEL[rarity]}】魚，'
+                        f'獲得 `{total:,}` 碎片', ephemeral=True,
+                    )
+                else:
+                    await interaction.followup.send(
+                        f'目前沒有【{F.RARITY_LABEL[rarity]}】魚可賣', ephemeral=True,
+                    )
+            except discord.HTTPException:
+                pass
+        return _cb
+
+    async def _open_custom(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        view = SellFishCustomView(self.uid, root_interaction=self.root_interaction)
+        await interaction.response.edit_message(
+            embed=view.build_embed(interaction.user), view=view,
+        )
+
+    async def _sell_all(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        from commands import fishing as F
+        count, total = await F.sell_all_fish(self.uid)
+        new = SellFishView(self.uid, root_interaction=self.root_interaction)
+        await interaction.response.edit_message(
+            embed=new.build_embed(interaction.user), view=new,
+        )
+        try:
+            await interaction.followup.send(
+                f'✅ 清空保溫箱：賣出 **{count}** 條，獲得 `{total:,}` 碎片', ephemeral=True,
+            )
+        except discord.HTTPException:
+            pass
+
+    async def _prev(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        new = SellFishView(self.uid, root_interaction=self.root_interaction,
+                           page=max(0, self.page - 1))
+        await interaction.response.edit_message(
+            embed=new.build_embed(interaction.user), view=new,
+        )
+
+    async def _next(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        new = SellFishView(self.uid, root_interaction=self.root_interaction,
+                           page=min(self.total_pages - 1, self.page + 1))
+        await interaction.response.edit_message(
+            embed=new.build_embed(interaction.user), view=new,
+        )
+
+
+class SellFishCustomView(_SellSubViewBase):
+    """販售保溫箱 — 自訂多選：勾選哪幾種（最多 25）→ 把選中的種類全部數量賣掉。"""
+
+    def __init__(self, uid: str, *, root_interaction: discord.Interaction,
+                 selected: list[str] | None = None):
+        super().__init__(uid, root_interaction)
+        from commands import fishing as F
+        self._owned: list[tuple[str, int]] = sorted(
+            ((k, int(v)) for k, v in F.get_fish(self.uid).items() if int(v) > 0),
+            key=lambda kv: (
+                list(F.RARITIES).index(F.FISH_SPECS[kv[0]]['rarity']),
+                kv[0],
+            ),
+        )
+        valid_keys = {k for k, _ in self._owned}
+        self.selected_keys: list[str] = [k for k in (selected or []) if k in valid_keys]
+        self._build()
+
+    def build_embed(self, user: discord.abc.User) -> discord.Embed:
+        from commands import fishing as F
+        if not self._owned:
+            desc = '_(保溫箱裡沒有任何魚)_'
+            preview = 0
+        else:
+            owned_map = dict(self._owned)
+            lines: list[str] = ['**🎯 自訂多選賣魚** — 勾選的種類會把擁有的數量全部賣掉', '']
+            for k, n in self._owned[:25]:
+                spec = F.FISH_SPECS[k]
+                mark = '☑️' if k in self.selected_keys else '⬜'
+                lines.append(
+                    f'{mark} {F.RARITY_EMOJI[spec["rarity"]]} '
+                    f'**{spec["name"]}** × {n} (`${spec["price"]:,}/條`)'
+                )
+            if len(self._owned) > 25:
+                lines.append(f'_…還有 {len(self._owned) - 25} 種未顯示（Discord 限制最多 25 個選項）_')
+            desc = '\n'.join(lines)
+            preview = sum(
+                int(F.FISH_SPECS[k]['price']) * int(owned_map.get(k, 0))
+                for k in self.selected_keys
+            )
+        return discord.Embed(
+            title='🛒 販售 — 保溫箱（自訂多選）',
+            description=desc + (
+                f'\n\n已選 **{len(self.selected_keys)}** 種，'
+                f'預估收益 **{preview:,}** 碎片'
+                f'\n💰 餘額：**{get_balance(self.uid):,}** 碎片'
+            ),
+            color=discord.Color.blurple(),
+        )
+
+    def _build(self) -> None:
+        from commands import fishing as F
+        options: list[discord.SelectOption] = []
+        for k, n in self._owned[:25]:
+            spec = F.FISH_SPECS[k]
+            options.append(discord.SelectOption(
+                label=f'{spec["name"]} × {n}',
+                description=f'{F.RARITY_LABEL[spec["rarity"]]} | ${spec["price"]:,}/條',
+                value=k,
+                default=(k in self.selected_keys),
+            ))
+        if options:
+            sel = discord.ui.Select(
+                placeholder='選擇要賣的魚種（可多選）',
+                options=options,
+                min_values=0,
+                max_values=min(len(options), 25),
+                row=0,
+            )
+            sel.callback = self._on_pick
+            self.add_item(sel)
+
+        confirm = discord.ui.Button(
+            label=f'💸 賣出選中 ({len(self.selected_keys)} 種)',
+            style=discord.ButtonStyle.danger,
+            disabled=(not self.selected_keys),
+            row=1,
+        )
+        confirm.callback = self._on_confirm
+        self.add_item(confirm)
+
+        back = discord.ui.Button(
+            label='⬅️ 返回保溫箱販售',
+            style=discord.ButtonStyle.secondary, row=1,
+        )
+        back.callback = self._on_back
+        self.add_item(back)
+
+    async def _on_pick(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        self.selected_keys = list(interaction.data.get('values', []))
+        new = SellFishCustomView(
+            self.uid, root_interaction=self.root_interaction,
+            selected=self.selected_keys,
+        )
+        await interaction.response.edit_message(
+            embed=new.build_embed(interaction.user), view=new,
+        )
+
+    async def _on_confirm(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        if not self.selected_keys:
+            await interaction.response.send_message('沒有選任何魚種', ephemeral=True)
+            return
+        from commands import fishing as F
+        total_count = 0
+        total_price = 0
+        for fk in self.selected_keys:
+            n = F.get_fish(self.uid).get(fk, 0)
+            if n <= 0:
+                continue
+            ok, _, gain = await F.sell_fish_from_pond(self.uid, fk, n)
+            if ok:
+                total_count += n
+                total_price += gain
+        new = SellFishView(self.uid, root_interaction=self.root_interaction)
+        await interaction.response.edit_message(
+            embed=new.build_embed(interaction.user), view=new,
+        )
+        try:
+            await interaction.followup.send(
+                f'✅ 自訂賣出 **{len(self.selected_keys)}** 種共 '
+                f'**{total_count}** 條，獲得 `{total_price:,}` 碎片',
+                ephemeral=True,
+            )
+        except discord.HTTPException:
+            pass
+
+    async def _on_back(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        new = SellFishView(self.uid, root_interaction=self.root_interaction)
+        await interaction.response.edit_message(
+            embed=new.build_embed(interaction.user), view=new,
+        )
+
+
+class SellMiscView(_SellSubViewBase):
+    def __init__(self, uid: str, *, root_interaction: discord.Interaction):
+        super().__init__(uid, root_interaction)
+        self._build()
+
+    def build_embed(self, user: discord.abc.User) -> discord.Embed:
+        miners = _get_miners(self.uid)
+        rev = _has_reverse(self.uid)
+        lines = [
+            f'⛏️ 礦工 × {miners}（單價 `{MINER_SELL_PRICE:,}`，半價）',
+            f'🪞 反轉牌 × {rev}（單價 `{REVERSE_SELL_PRICE:,}`，半價）',
+            '',
+            f'💰 餘額：**{get_balance(self.uid):,}** 碎片',
+        ]
+        return discord.Embed(
+            title='🛒 販售 — 其他道具',
+            description='\n'.join(lines),
+            color=discord.Color.blurple(),
+        )
+
+    def _build(self) -> None:
+        miners = _get_miners(self.uid)
+        rev = _has_reverse(self.uid)
+
+        sell_miner_1 = discord.ui.Button(
+            label=f'賣 1 台礦工 (+{MINER_SELL_PRICE:,})',
+            style=discord.ButtonStyle.primary, disabled=(miners <= 0), row=0,
+        )
+        sell_miner_1.callback = self._make_misc_cb('miner', 1)
+        self.add_item(sell_miner_1)
+
+        sell_miner_all = discord.ui.Button(
+            label=f'全賣礦工 ×{miners}',
+            style=discord.ButtonStyle.danger, disabled=(miners <= 0), row=0,
+        )
+        sell_miner_all.callback = self._make_misc_cb('miner', miners)
+        self.add_item(sell_miner_all)
+
+        sell_rev = discord.ui.Button(
+            label=f'賣 1 張反轉牌 (+{REVERSE_SELL_PRICE:,})',
+            style=discord.ButtonStyle.primary, disabled=(rev <= 0), row=1,
+        )
+        sell_rev.callback = self._make_misc_cb('reverse', 1)
+        self.add_item(sell_rev)
+
+        back = discord.ui.Button(label='⬅️ 返回販售', style=discord.ButtonStyle.secondary, row=2)
+        back.callback = self._back_to_sell
+        self.add_item(back)
+
+    def _make_misc_cb(self, kind: str, n: int):
+        async def _cb(interaction: discord.Interaction) -> None:
+            if not await self._check(interaction):
+                return
+            if kind == 'miner':
+                ok, err, gain = await _atomic_sell_miner(self.uid, n)
+                name = '礦工'
+            else:
+                ok, err, gain = await _atomic_sell_reverse(self.uid, n)
+                name = '反轉牌'
+            new = SellMiscView(self.uid, root_interaction=self.root_interaction)
+            await interaction.response.edit_message(
+                embed=new.build_embed(interaction.user), view=new,
+            )
+            msg = f'✅ 已賣出 {name} × {n}，獲得 `{gain:,}` 碎片' if ok else f'❌ {err}'
+            try:
+                await interaction.followup.send(msg, ephemeral=True)
+            except discord.HTTPException:
+                pass
+        return _cb
+
+
+class _SellQtyModal(discord.ui.Modal, title='販售數量'):
+    qty_input = discord.ui.TextInput(
+        label='數量', placeholder='輸入要賣幾個', required=True,
+        min_length=1, max_length=4, default='1',
+    )
+
+    def __init__(self, uid: str, root_interaction: discord.Interaction,
+                 *, mode: str, key: str, parent: str):
+        super().__init__()
+        self.uid = uid
+        self.root_interaction = root_interaction
+        self.mode = mode
+        self.key = key
+        self.parent = parent
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            qty = int(str(self.qty_input.value).strip())
+        except ValueError:
+            await interaction.response.send_message('數量必須是整數', ephemeral=True)
+            return
+        if qty <= 0:
+            await interaction.response.send_message('數量必須為正', ephemeral=True)
+            return
+
+        from commands import fishing as F
+        if self.mode == 'bait':
+            ok, err, gain = await F.sell_bait(self.uid, self.key, qty)
+            name = F.BAIT_SPECS[self.key]['name']
+        elif self.mode == 'fish':
+            ok, err, gain = await F.sell_fish_from_pond(self.uid, self.key, qty)
+            name = F.FISH_SPECS[self.key]['name']
+        else:
+            await interaction.response.send_message('未知販售類型', ephemeral=True)
+            return
+
+        # 刷新對應的 sub-view
+        try:
+            await interaction.response.defer()
+        except discord.HTTPException:
+            pass
+        if self.parent == 'bait':
+            new_view = SellBaitsView(self.uid, root_interaction=self.root_interaction)
+        else:
+            new_view = SellFishView(self.uid, root_interaction=self.root_interaction)
+        try:
+            await self.root_interaction.edit_original_response(
+                embed=new_view.build_embed(interaction.user), view=new_view,
+            )
+        except discord.HTTPException:
+            pass
+        msg = f'✅ 已賣出 **{name}** × {qty}，獲得 `{gain:,}` 碎片' if ok else f'❌ {err}'
+        try:
+            await interaction.followup.send(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+
+# ── 贈禮 View ────────────────────────────────────────────────────────────
+class GiftMainView(discord.ui.View):
+    """贈禮：選收禮人 + 選類別 + 選物品 + 數量。在當前頻道發 @ 公開贈禮訊息。"""
+
+    def __init__(self, uid: str, guild: discord.Guild,
+                 *, root_interaction: discord.Interaction):
+        super().__init__(timeout=300)
+        self.uid = uid
+        self.guild = guild
+        self.root_interaction = root_interaction
+        self.recipient_id: int | None = None
+        self.category: str | None = None     # 'rod' | 'bait' | 'fish' | 'reverse' | 'miner'
+        self.item_key: str | None = None
+        self._build()
+
+    def build_embed(self, user: discord.abc.User) -> discord.Embed:
+        recip = f'<@{self.recipient_id}>' if self.recipient_id else '_(尚未選擇)_'
+        cat_label = {
+            'rod': '釣竿', 'bait': '魚餌', 'fish': '魚',
+            'reverse': '反轉牌', 'miner': '礦工',
+        }.get(self.category or '', '_(尚未選擇)_')
+        item = self._item_label() if self.item_key else '_(尚未選擇)_'
+        lines = [
+            '**🎁 贈禮 — 把道具送給其他玩家**',
+            '',
+            '流程：① 選收禮人 → ② 選類別 → ③ 選物品 → ④ 點「送出」',
+            '送出後會在目前頻道發訊息 @ 對方，對方點接收才會入庫；48 小時未接收自動退回。',
+            '',
+            f'👤 收禮人：{recip}',
+            f'📦 類別：{cat_label}',
+            f'🎁 物品：{item}',
+        ]
+        return discord.Embed(
+            title='🛒 商店',
+            description='\n'.join(lines),
+            color=discord.Color.green(),
+        )
+
+    def _item_label(self) -> str:
+        from commands import fishing as F
+        if self.category == 'rod':
+            spec = F.ROD_SPECS.get(self.item_key or '')
+            return f'T{spec["tier"]} {spec["name"]}' if spec else '?'
+        if self.category == 'bait':
+            spec = F.BAIT_SPECS.get(self.item_key or '')
+            return spec['name'] if spec else '?'
+        if self.category == 'fish':
+            spec = F.FISH_SPECS.get(self.item_key or '')
+            return spec['name'] if spec else '?'
+        if self.category == 'reverse':
+            return '反轉牌'
+        if self.category == 'miner':
+            return '礦工'
+        return '?'
+
+    def _build(self) -> None:
+        self.clear_items()
+
+        # Row 0: 選收禮人
+        user_sel = discord.ui.UserSelect(
+            placeholder='選擇收禮人', min_values=1, max_values=1, row=0,
+        )
+        user_sel.callback = self._on_user
+        self.add_item(user_sel)
+
+        # Row 1: 類別 Select
+        cat_options = [
+            discord.SelectOption(label='釣竿',   value='rod',   emoji='🎣'),
+            discord.SelectOption(label='魚餌',   value='bait',  emoji='🪱'),
+            discord.SelectOption(label='魚',     value='fish',  emoji='🐟'),
+            discord.SelectOption(label='反轉牌', value='reverse', emoji='🪞'),
+            discord.SelectOption(label='礦工',   value='miner', emoji='⛏️'),
+        ]
+        cat_sel = discord.ui.Select(
+            placeholder='選擇贈禮類別',
+            options=cat_options, min_values=1, max_values=1, row=1,
+        )
+        cat_sel.callback = self._on_cat
+        self.add_item(cat_sel)
+
+        # Row 2: 物品 Select（依 category 動態填）
+        item_options = self._item_options()
+        if item_options:
+            item_sel = discord.ui.Select(
+                placeholder='選擇要送的物品',
+                options=item_options[:25], min_values=1, max_values=1, row=2,
+            )
+            item_sel.callback = self._on_item
+            self.add_item(item_sel)
+        else:
+            placeholder = '請先選類別 / 該類別下沒有可贈禮的物品'
+            item_sel = discord.ui.Select(
+                placeholder=placeholder,
+                options=[discord.SelectOption(label='(空)', value='_none')],
+                min_values=1, max_values=1, row=2, disabled=True,
+            )
+            self.add_item(item_sel)
+
+        # Row 3: 送出 / 返回
+        send_btn = discord.ui.Button(
+            label='🚀 送出贈禮', style=discord.ButtonStyle.success,
+            disabled=not (self.recipient_id and self.category and self.item_key),
+            row=3,
+        )
+        send_btn.callback = self._on_send
+        self.add_item(send_btn)
+
+        back = discord.ui.Button(
+            label='⬅️ 返回商店', style=discord.ButtonStyle.secondary, row=3,
+        )
+        back.callback = self._back
+        self.add_item(back)
+
+    def _item_options(self) -> list[discord.SelectOption]:
+        from commands import fishing as F
+        if self.category == 'rod':
+            return [
+                discord.SelectOption(
+                    label=f'T{F.ROD_SPECS[r]["tier"]} {F.ROD_SPECS[r]["name"]}',
+                    value=r,
+                )
+                for r in F.get_rods(self.uid)
+            ]
+        if self.category == 'bait':
+            return [
+                discord.SelectOption(
+                    label=f'{F.BAIT_SPECS[k]["name"]} × {n}', value=k,
+                )
+                for k, n in F.get_baits(self.uid).items()
+                if int(n) > 0 and k in F.BAIT_SPECS
+            ]
+        if self.category == 'fish':
+            return [
+                discord.SelectOption(
+                    label=f'{F.FISH_SPECS[k]["name"]} × {n}',
+                    description=F.RARITY_LABEL[F.FISH_SPECS[k]['rarity']],
+                    value=k,
+                )
+                for k, n in F.get_fish(self.uid).items()
+                if int(n) > 0 and k in F.FISH_SPECS
+            ][:25]
+        if self.category == 'reverse':
+            n = _has_reverse(self.uid)
+            if n > 0:
+                return [discord.SelectOption(label=f'反轉牌 × {n}', value='reverse')]
+            return []
+        if self.category == 'miner':
+            n = _get_miners(self.uid)
+            if n > 0:
+                return [discord.SelectOption(label=f'礦工 × {n}', value='miner')]
+            return []
+        return []
+
+    async def _check(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) != self.uid:
+            await interaction.response.send_message('這不是你的商店', ephemeral=True)
+            return False
+        return True
+
+    async def _redraw(self, interaction: discord.Interaction) -> None:
+        self.clear_items()
+        self._build()
+        await interaction.response.edit_message(
+            embed=self.build_embed(interaction.user), view=self,
+        )
+
+    async def _on_user(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        selected_ids = interaction.data.get('values', [])
+        if not selected_ids:
+            await interaction.response.defer()
+            return
+        rid = int(selected_ids[0])
+        if rid == int(self.uid):
+            await interaction.response.send_message('不能贈禮給自己', ephemeral=True)
+            return
+        member = self.guild.get_member(rid)
+        if member is not None and member.bot:
+            await interaction.response.send_message('不能贈禮給機器人', ephemeral=True)
+            return
+        self.recipient_id = rid
+        await self._redraw(interaction)
+
+    async def _on_cat(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        self.category = interaction.data['values'][0]
+        self.item_key = None
+        await self._redraw(interaction)
+
+    async def _on_item(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        val = interaction.data['values'][0]
+        if val == '_none':
+            await interaction.response.defer()
+            return
+        self.item_key = val
+        await self._redraw(interaction)
+
+    async def _on_send(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        if not (self.recipient_id and self.category and self.item_key):
+            await interaction.response.send_message('資料未填齊', ephemeral=True)
+            return
+
+        from commands import fishing as F
+
+        # 反轉牌 / 礦工 — 直接 atomic transfer（無接收按鈕的延後機制，因受方有上限）
+        if self.category in ('reverse', 'miner'):
+            if self.category == 'reverse':
+                ok, err = await _atomic_transfer_reverse(self.uid, str(self.recipient_id), 1)
+                item_zh = '張反轉牌'
+            else:
+                ok, err = await _atomic_transfer_miner(self.uid, str(self.recipient_id), 1)
+                item_zh = '台礦工'
+            await self._redraw(interaction)
+            if not ok:
+                try:
+                    await interaction.followup.send(f'❌ {err}', ephemeral=True)
+                except discord.HTTPException:
+                    pass
+                return
+            try:
+                await interaction.followup.send(
+                    f'✅ 已將 1 {item_zh} 轉交給 <@{self.recipient_id}>',
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
+            try:
+                await interaction.channel.send(
+                    f'🎁 <@{self.uid}> 贈送了 1 {item_zh} 給 <@{self.recipient_id}>！',
+                    allowed_mentions=discord.AllowedMentions(users=True),
+                )
+            except discord.HTTPException:
+                pass
+            return
+
+        # 釣竿 / 魚餌 / 魚 — 走 create_gift（pending 機制）
+        ok, err, gid = await F.create_gift(
+            from_uid=self.uid, to_uid=str(self.recipient_id),
+            category=self.category, key=self.item_key, qty=1,
+            guild_id=self.guild.id, channel_id=interaction.channel_id,
+        )
+        await self._redraw(interaction)
+        if not ok:
+            try:
+                await interaction.followup.send(f'❌ {err}', ephemeral=True)
+            except discord.HTTPException:
+                pass
+            return
+
+        # 在當前頻道發公開訊息 + GiftAcceptView
+        try:
+            view = F.GiftAcceptView(gid)
+            item_label = self._item_label()
+            await interaction.channel.send(
+                f'🎁 <@{self.recipient_id}> 你收到 <@{self.uid}> 的贈禮：'
+                f'**{item_label}**（48 小時內請點下方按鈕接收）',
+                view=view,
+                allowed_mentions=discord.AllowedMentions(users=True),
+            )
+            await interaction.followup.send(
+                '✅ 贈禮已發送，等對方接收。', ephemeral=True,
+            )
+        except discord.HTTPException as e:
+            # 發訊息失敗 → 退回贈禮
+            await F.refund_gift(gid)
+            try:
+                await interaction.followup.send(
+                    f'❌ 發送公開訊息失敗：{e}（贈禮已退回你）', ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
+
+    async def _back(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        await _render_main_via_edit(interaction, self.root_interaction)
+
+
 # ── 主介面 (Shop Main) ──────────────────────────────────────────────────
 def _main_shop_embed(user: discord.abc.User) -> discord.Embed:
     uid     = str(user.id)
@@ -1708,10 +3227,14 @@ def _main_shop_embed(user: discord.abc.User) -> discord.Embed:
         (f'⚗️ **{_POTION_TIERS["c"]["name"]}** ×{_POTION_TIERS["c"]["mult"]} '
          f'— `{_POTION_TIERS["c"]["price"]:,}` / 24h'),
         f'🎨 **限時自訂身分組** — `{CUSTOM_ROLE_PRICE:,}` / 個（{CUSTOM_ROLE_DURATION_DAYS} 天）',
-        f'💊 **真心話藥丸** — `{TRUTH_PILL_PRICE:,}` / 顆（{TRUTH_PILL_DURATION_HOURS}h 改寫目標訊息）',
+        f'🦴 **調教項圈** — `{TRUTH_PILL_PRICE:,}` / 顆（{TRUTH_PILL_DURATION_HOURS}h 改寫目標訊息）',
         f'🪞 **反轉牌** — `{REVERSE_CARD_PRICE:,}` / 張（被整蠱時自動反彈）',
-        f'💉 **解藥** — `{ANTIDOTE_PRICE:,}` / 劑（解除真心話藥丸效果）',
+        f'🔑 **項圈鑰匙** — `{ANTIDOTE_PRICE:,}` / 劑（解除調教項圈效果）',
         f'📛 **改名板** — `{NICKNAME_PRICE:,}` / 次（自訂 AI 聊天時的稱呼）',
+        '🎣 **/fishing** — 釣魚系統 (釣竿、魚餌、保溫箱)',
+        '',
+        '💸 **販售**：把多餘的釣竿/魚餌/魚/反轉牌/礦工換成碎片',
+        '🎁 **贈禮**：把道具送給其他玩家（48h 未接收自動退回）',
         '',
         '💡 餘額不夠？點 **前往電子銀行股市** 賣股/提款補錢喵～',
     ]
@@ -1729,10 +3252,12 @@ _CATEGORY_SPECS: list[tuple[str, str, int, bool]] = [
     ('miner',    '⛏️ 礦工',         0, False),
     ('potion',   '🧪 能量藥水',     0, False),
     ('nickname', '📛 改名板',       0, False),
+    ('reverse',  '🪞 反轉牌',       0, False),
     ('role',     '🎨 限時身分組',   1, True),
-    ('pill',     '💊 真心話藥丸',   1, True),
-    ('antidote', '💉 解藥',         1, True),
-    ('reverse',  '🪞 反轉牌',       2, False),
+    ('pill',     '🦴 調教項圈',     1, True),
+    ('fishingequip', '🎣 釣魚用品', 1, False),
+    ('sell',     '💸 販售',         2, False),
+    ('gift',     '🎁 贈禮',         2, True),
 ]
 
 
@@ -1805,12 +3330,18 @@ class ShopMainView(discord.ui.View):
             elif key == 'pill' and guild is not None:
                 view  = TruthPillShopView(self.uid, guild, root_interaction=root)
                 embed = _pill_embed(user)
-            elif key == 'antidote' and guild is not None:
-                view  = AntidoteShopView(self.uid, guild, root_interaction=root)
-                embed = _antidote_embed(user)
+            elif key == 'fishingequip':
+                view  = ShopFishingEquipView(self.uid, root_interaction=root)
+                embed = view.build_embed(user)
             elif key == 'reverse':
                 view  = ReverseCardShopView(self.uid, root_interaction=root)
                 embed = _reverse_card_embed(user)
+            elif key == 'sell':
+                view  = SellMainView(self.uid, root_interaction=root)
+                embed = view.build_embed(user)
+            elif key == 'gift' and guild is not None:
+                view  = GiftMainView(self.uid, guild, root_interaction=root)
+                embed = view.build_embed(user)
             else:
                 await interaction.response.send_message('此商品需在伺服器內使用', ephemeral=True)
                 return

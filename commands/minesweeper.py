@@ -34,7 +34,10 @@ import discord
 from commands._setup import (
     MIN_BET, EndOfGameView, insufficient_embed, make_bet_row, tier_label,
 )
-from commands._wallet import apply_delta, get_balance, send_or_edit, send_smart
+from commands._wallet import (
+    apply_delta, get_balance, send_or_edit, send_smart,
+    settle_with_streak, streak_line,
+)
 
 
 GAME_NAME = '踩地雷'
@@ -190,10 +193,11 @@ def _running_embed(user: discord.abc.User, game: MinesGame) -> discord.Embed:
 
 
 def _cashed_embed(user: discord.abc.User, game: MinesGame,
-                  balance: int) -> discord.Embed:
+                  balance: int, streak: int = 0,
+                  bonus: int = 0) -> discord.Embed:
     mult     = game.current_mult()
     payout   = int(game.bet * mult)
-    net      = payout - game.bet
+    net      = payout - game.bet + bonus
     sign     = f'+{net}' if net >= 0 else str(net)
     _, color = tier_label(payout, game.bet)
     desc = [
@@ -201,9 +205,11 @@ def _cashed_embed(user: discord.abc.User, game: MinesGame,
         '',
         f'💰 提現 @ **{mult:.2f}x**',
         f'投注 {game.bet}　取回 **{payout}**　淨 **{sign}**',
-        '',
-        f'餘額：**{balance}** 咕嚕喵碎片',
     ]
+    sl = streak_line(streak, bonus)
+    if sl:
+        desc.append(sl)
+    desc += ['', f'餘額：**{balance}** 咕嚕喵碎片']
     embed = discord.Embed(
         title=f'💣 {GAME_NAME}　{sign}',
         description='\n'.join(desc), color=color,
@@ -317,13 +323,17 @@ class MinesGameView(discord.ui.View):
         if self.game.cashed:
             mult   = self.game.current_mult()
             payout = int(self.game.bet * mult)
-            if payout > 0:
-                await apply_delta(self.uid, payout)
-            balance = get_balance(self.uid)
-            embed   = _cashed_embed(interaction.user, self.game, balance)
+            balance, streak, bonus = await settle_with_streak(
+                self.uid, self.game.bet, payout, deducted=True,
+            )
+            embed = _cashed_embed(interaction.user, self.game, balance,
+                                  streak, bonus)
         else:
-            balance = get_balance(self.uid)
-            embed   = _crashed_embed(interaction.user, self.game, balance)
+            # 踩雷：本金已扣，payout=0，streak 歸 0
+            balance, _, _ = await settle_with_streak(
+                self.uid, self.game.bet, 0, deducted=True,
+            )
+            embed = _crashed_embed(interaction.user, self.game, balance)
 
         end_view = EndOfGameView(
             self.uid, self.game.bet,
@@ -366,7 +376,7 @@ class MinesSetupView(discord.ui.View):
     def _build(self) -> None:
         self.clear_items()
         # row 0：下注金額
-        for btn in make_bet_row(self, self._refresh, row=0):
+        for btn in make_bet_row(self, self._redraw, row=0):
             self.add_item(btn)
         # row 1：難度
         for n in DIFFICULTIES:
@@ -395,10 +405,10 @@ class MinesSetupView(discord.ui.View):
                 )
                 return
             self.mines = n
-            await self._refresh(interaction)
+            await self._redraw(interaction)
         return _cb
 
-    async def _refresh(self, interaction: discord.Interaction) -> None:
+    async def _redraw(self, interaction: discord.Interaction) -> None:
         self._build()
         embed = _setup_embed(interaction.user, self.bet, self.mines)
         await interaction.response.edit_message(embed=embed, view=self)

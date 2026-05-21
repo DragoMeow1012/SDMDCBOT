@@ -27,7 +27,9 @@ import discord
 from commands._setup import (
     EndOfGameView, insufficient_embed, make_bet_row, tier_label,
 )
-from commands._wallet import get_balance, send_or_edit, send_smart, settle_bet
+from commands._wallet import (
+    get_balance, send_or_edit, send_smart, settle_with_streak, streak_line,
+)
 
 
 _RESCUE_PROB   = 0.35   # 失敗時 35% 機率拿回部分本金（平衡：稍微提高勝率）
@@ -187,17 +189,21 @@ def _setup_embed(user: discord.abc.User, bet: int,
 def _result_embed(user: discord.abc.User, bet: int,
                   category: str, detail: int | None,
                   dice: tuple[int, int, int], payout: int,
-                  result_desc: str, balance: int) -> discord.Embed:
+                  result_desc: str, balance: int,
+                  streak: int = 0, bonus: int = 0) -> discord.Embed:
     _, color = tier_label(payout, bet)
-    net  = payout - bet
+    net  = payout - bet + bonus
     sign = f'+{net}' if net >= 0 else str(net)
     total = sum(dice)
     desc = [
         f'{_dice_str(dice)}　總和 **{total}**', '',
         f'押注：**{_bet_desc(category, detail)}**（{bet} 咕嚕喵碎片）',
-        result_desc, '',
-        f'淨損益 **{sign}**　|　餘額 **{balance}** 咕嚕喵碎片',
+        result_desc,
     ]
+    sl = streak_line(streak, bonus)
+    if sl:
+        desc.append(sl)
+    desc += ['', f'淨損益 **{sign}**　|　餘額 **{balance}** 咕嚕喵碎片']
     embed = discord.Embed(
         title=f'🎲 {GAME_NAME}　{sign}',
         description='\n'.join(desc), color=color,
@@ -227,7 +233,7 @@ class DiceSetupView(discord.ui.View):
 
     def _rebuild(self) -> None:
         self.clear_items()
-        for btn in make_bet_row(self, self._refresh, row=0):
+        for btn in make_bet_row(self, self._redraw, row=0):
             self.add_item(btn)
         self.add_item(self._cat_select())
         if self.category in _NEEDS_DETAIL:
@@ -248,7 +254,7 @@ class DiceSetupView(discord.ui.View):
                 await self._deny(interaction); return
             self.category = sel.values[0]
             self.detail   = None
-            await self._refresh(interaction)
+            await self._redraw(interaction)
 
         sel.callback = _cb
         return sel
@@ -294,7 +300,7 @@ class DiceSetupView(discord.ui.View):
             if not self._check_owner(interaction):
                 await self._deny(interaction); return
             self.detail = int(sel.values[0])
-            await self._refresh(interaction)
+            await self._redraw(interaction)
 
         sel.callback = _cb
         return sel
@@ -310,7 +316,7 @@ class DiceSetupView(discord.ui.View):
         btn.callback = self._start_cb
         return btn
 
-    async def _refresh(self, interaction: discord.Interaction) -> None:
+    async def _redraw(self, interaction: discord.Interaction) -> None:
         self._rebuild()
         embed = _setup_embed(
             interaction.user, self.bet, self.category, self.detail,
@@ -380,10 +386,10 @@ async def run_round(interaction: discord.Interaction, bet: int,
     dice = _roll()
     payout, result_desc = _compute_payout(category, detail, dice, bet)
     payout, result_desc = _apply_rescue(payout, bet, result_desc)
-    new_balance = await settle_bet(uid, bet, payout)
+    new_balance, streak, bonus = await settle_with_streak(uid, bet, payout)
     embed = _result_embed(
         interaction.user, bet, category, detail,
-        dice, payout, result_desc, new_balance,
+        dice, payout, result_desc, new_balance, streak, bonus,
     )
     end_view = EndOfGameView(
         uid, bet, {'category': category, 'detail': detail},

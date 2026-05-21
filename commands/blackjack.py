@@ -28,7 +28,10 @@ import discord
 from commands._setup import (
     EndOfGameView, insufficient_embed, make_bet_row, tier_label,
 )
-from commands._wallet import apply_delta, get_balance, send_or_edit, send_smart
+from commands._wallet import (
+    apply_delta, get_balance, send_or_edit, send_smart,
+    settle_with_streak, streak_line,
+)
 
 
 GAME_NAME   = '21 點 (Blackjack)'
@@ -418,7 +421,8 @@ class BlackjackGame:
 def _build_embed(user: discord.abc.User, game: BlackjackGame,
                  committed: int, payout: int | None,
                  results: list[tuple[str, int]] | None,
-                 balance: int) -> discord.Embed:
+                 balance: int, streak: int = 0,
+                 bonus: int = 0) -> discord.Embed:
     hide = (game.phase == 'player')
     dealer_str = _cards_str(game.dealer, hide_first=hide)
     dealer_val = '?' if hide else str(_hand_value(game.dealer))
@@ -469,11 +473,14 @@ def _build_embed(user: discord.abc.User, game: BlackjackGame,
     else:
         assert payout is not None
         _, color = tier_label(payout, committed)
-        net  = payout - committed
+        net  = payout - committed + bonus
         sign = f'+{net}' if net >= 0 else str(net)
         title = f'🃏 21 點　{sign}'
-        lines += ['', f'總投注 {committed}　取回 {payout}　淨 **{sign}**',
-                  f'餘額：**{balance}** 咕嚕喵碎片']
+        lines += ['', f'總投注 {committed}　取回 {payout}　淨 **{sign}**']
+        sl = streak_line(streak, bonus)
+        if sl:
+            lines.append(sl)
+        lines.append(f'餘額：**{balance}** 咕嚕喵碎片')
 
     embed = discord.Embed(title=title, description='\n'.join(lines), color=color)
     embed.set_footer(text=user.display_name)
@@ -541,45 +548,46 @@ class BlackjackView(discord.ui.View):
 
     async def _hit(self, interaction: discord.Interaction) -> None:
         self.game.hit()
-        await self._refresh(interaction)
+        await self._redraw(interaction)
 
     async def _stand(self, interaction: discord.Interaction) -> None:
         self.game.stand()
-        await self._refresh(interaction)
+        await self._redraw(interaction)
 
     async def _double(self, interaction: discord.Interaction) -> None:
         extra = self.game.double()
         await apply_delta(self.uid, -extra)
         self.committed += extra
-        await self._refresh(interaction)
+        await self._redraw(interaction)
 
     async def _split(self, interaction: discord.Interaction) -> None:
         extra = self.game.split(self.base_bet)
         await apply_delta(self.uid, -extra)
         self.committed += extra
-        await self._refresh(interaction)
+        await self._redraw(interaction)
 
     async def _surrender(self, interaction: discord.Interaction) -> None:
         self.game.surrender()
-        await self._refresh(interaction)
+        await self._redraw(interaction)
 
     async def _insurance(self, interaction: discord.Interaction) -> None:
         amount = self.game.take_insurance(self.base_bet)
         await apply_delta(self.uid, -amount)
         self.committed += amount
         # 買完保險後莊家就掀牌（take_insurance 內已 peek）
-        await self._refresh(interaction)
+        await self._redraw(interaction)
 
-    async def _refresh(self, interaction: discord.Interaction) -> None:
+    async def _redraw(self, interaction: discord.Interaction) -> None:
         if self.game.phase == 'done':
             results = self.game.results()
             payout  = sum(p for _, p in results)
-            if payout > 0:
-                await apply_delta(self.uid, payout)
-            balance = get_balance(self.uid)
-            embed   = _build_embed(
+            # 本金已扣（committed），payout 為總取回。連勝以 committed 為 bet 比較。
+            balance, streak, bonus = await settle_with_streak(
+                self.uid, self.committed, payout, deducted=True,
+            )
+            embed = _build_embed(
                 interaction.user, self.game, self.committed,
-                payout, results, balance,
+                payout, results, balance, streak, bonus,
             )
             end_view = EndOfGameView(
                 self.uid, self.base_bet,
@@ -626,7 +634,7 @@ class BlackjackSetupView(discord.ui.View):
 
     def _build(self) -> None:
         self.clear_items()
-        for btn in make_bet_row(self, self._refresh, row=0):
+        for btn in make_bet_row(self, self._redraw, row=0):
             self.add_item(btn)
         # 21+3 邊注切換
         toggle = discord.ui.Button(
@@ -652,9 +660,9 @@ class BlackjackSetupView(discord.ui.View):
             )
             return
         self.side_21_3 = not self.side_21_3
-        await self._refresh(interaction)
+        await self._redraw(interaction)
 
-    async def _refresh(self, interaction: discord.Interaction) -> None:
+    async def _redraw(self, interaction: discord.Interaction) -> None:
         self._build()
         await interaction.response.edit_message(
             embed=_setup_embed(interaction.user, self.bet, self.side_21_3),
@@ -724,11 +732,12 @@ async def run_round(interaction: discord.Interaction, bet: int,
     if game.phase == 'done':
         results = game.results()
         payout  = sum(p for _, p in results)
-        if payout > 0:
-            await apply_delta(uid, payout)
-        balance = get_balance(uid)
+        balance, streak, bonus = await settle_with_streak(
+            uid, committed, payout, deducted=True,
+        )
         embed = _build_embed(
             interaction.user, game, committed, payout, results, balance,
+            streak, bonus,
         )
         view = EndOfGameView(
             uid, bet, {'side_21_3': side_21_3},

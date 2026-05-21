@@ -20,3 +20,9 @@ _miner_task_started: bool = False
 
 # Persistent View（檢舉 / 管理員處置）註冊旗標
 _persistent_views_registered: bool = False
+
+# /fishing 背景任務（贈禮過期）啟動旗標 + active_session 重啟清理旗標
+_fishing_task_started: bool = False
+
+# 槓桿（保證金）SL/TP + 強制清算背景任務啟動旗標
+_margin_task_started: bool = False

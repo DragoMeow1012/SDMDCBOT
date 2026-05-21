@@ -47,6 +47,58 @@ async def settle_bet(uid: str, cost: int, payout: int) -> int:
     return await apply_delta(uid, payout - cost)
 
 
+# ── 連勝倍率（gamble_streak）────────────────────────────────────────────
+# 每連勝 N 把（N>=2），淨贏額外 ×min(0.05*(N-1), 0.30)。輸歸 0、平手不變。
+STREAK_BONUS_PER_STEP = 0.05
+STREAK_BONUS_CAP      = 0.30
+
+
+def get_streak(uid: str) -> int:
+    return int(load_json(_FILE).get('users', {}).get(uid, {}).get('gamble_streak', 0))
+
+
+async def settle_with_streak(
+    uid: str, bet: int, payout: int, *, deducted: bool = False,
+) -> tuple[int, int, int]:
+    """賭局結算 + 連勝倍率。
+
+    bet:    本金（>0）。
+    payout: 該回回收金額（含本金）。0=全輸、==bet 平手、>bet 淨贏。
+    deducted: False → 餘額 += (payout-bet)（本金尚未扣）；
+              True  → 餘額 += payout（本金已先扣）。
+
+    Returns (new_balance, streak, bonus).
+    """
+    won  = payout > bet
+    lost = payout < bet
+
+    data  = load_json(_FILE)
+    users = data.setdefault('users', {})
+    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+
+    streak = int(rec.get('gamble_streak', 0))
+    bonus  = 0
+    if won:
+        streak += 1
+        pct = min(STREAK_BONUS_PER_STEP * (streak - 1), STREAK_BONUS_CAP)
+        bonus = int((payout - bet) * pct)
+    elif lost:
+        streak = 0
+
+    delta = (payout if deducted else (payout - bet)) + bonus
+    rec['balance']       = int(rec.get('balance', 0)) + delta
+    rec['gamble_streak'] = streak
+    await save_json_async(_FILE, data)
+    return int(rec['balance']), streak, bonus
+
+
+def streak_line(streak: int, bonus: int) -> str | None:
+    """賭場結算 embed 用的連勝紅利顯示行。streak<2 或 bonus<=0 回 None。"""
+    if streak < 2 or bonus <= 0:
+        return None
+    return f'🔥 連勝 **{streak}** 把，紅利 **+{bonus:,}**'
+
+
 async def send_smart(interaction: discord.Interaction, **kwargs: Any) -> Any:
     """同一個 interaction：第一次 → response.send_message；
     response 已用過（例如按鈕已 edit_message） → followup.send。

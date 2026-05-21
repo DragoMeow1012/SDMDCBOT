@@ -1649,7 +1649,7 @@ class PVPSetupView(discord.ui.View):
 
     def _build(self) -> None:
         self.clear_items()
-        for btn in make_bet_row(self, self._refresh, row=0):
+        for btn in make_bet_row(self, self._redraw, row=0):
             self.add_item(btn)
         start = discord.ui.Button(
             label='發起挑戰', emoji='⚔️',
@@ -1658,7 +1658,7 @@ class PVPSetupView(discord.ui.View):
         start.callback = self._start_cb
         self.add_item(start)
 
-    async def _refresh(self, interaction: discord.Interaction) -> None:
+    async def _redraw(self, interaction: discord.Interaction) -> None:
         self._build()
         await interaction.response.edit_message(
             embed=_setup_embed(interaction.user, self.opponent, self.bet),

@@ -20,7 +20,9 @@ import discord
 from commands._setup import (
     EndOfGameView, insufficient_embed, make_bet_row, tier_label,
 )
-from commands._wallet import get_balance, send_or_edit, send_smart, settle_bet
+from commands._wallet import (
+    get_balance, send_or_edit, send_smart, settle_with_streak, streak_line,
+)
 
 
 GAME_NAME   = '老虎機 3×3'
@@ -83,9 +85,10 @@ def _render_grid(grid: list[str]) -> str:
 
 def _result_embed(user: discord.abc.User, grid: list[str],
                   hits: list[tuple[str, str, int, int]],
-                  bet: int, payout: int, balance: int) -> discord.Embed:
+                  bet: int, payout: int, balance: int,
+                  streak: int = 0, bonus: int = 0) -> discord.Embed:
     _, color = tier_label(payout, bet)
-    net  = payout - bet
+    net  = payout - bet + bonus
     sign = f'+{net}' if net >= 0 else str(net)
     desc: list[str] = [_render_grid(grid), '']
     if hits:
@@ -96,6 +99,9 @@ def _result_embed(user: discord.abc.User, grid: list[str],
     else:
         desc.append('沒中任何一線... ／(•ㅿ•)＼')
         desc.append(f'投注 {bet}')
+    sl = streak_line(streak, bonus)
+    if sl:
+        desc.append(sl)
     desc.append(f'\n淨損益 **{sign}**　|　餘額 **{balance}** 咕嚕喵碎片')
 
     embed = discord.Embed(
@@ -132,7 +138,7 @@ class SlotSetupView(discord.ui.View):
 
     def _build(self) -> None:
         self.clear_items()
-        for btn in make_bet_row(self, self._refresh, row=0):
+        for btn in make_bet_row(self, self._redraw, row=0):
             self.add_item(btn)
         start = discord.ui.Button(
             label='開轉', emoji='🎰',
@@ -141,7 +147,7 @@ class SlotSetupView(discord.ui.View):
         start.callback = self._start_cb
         self.add_item(start)
 
-    async def _refresh(self, interaction: discord.Interaction) -> None:
+    async def _redraw(self, interaction: discord.Interaction) -> None:
         self._build()
         await interaction.response.edit_message(
             embed=_setup_embed(interaction.user, self.bet), view=self,
@@ -189,8 +195,8 @@ async def run_round(interaction: discord.Interaction, bet: int,
         return
     grid         = _spin()
     hits, payout = _evaluate(grid, bet)
-    new_balance  = await settle_bet(uid, bet, payout)
+    new_balance, streak, bonus = await settle_with_streak(uid, bet, payout)
     embed = _result_embed(interaction.user, grid, hits, bet,
-                          payout, new_balance)
+                          payout, new_balance, streak, bonus)
     end_view = EndOfGameView(uid, bet, {}, run_round, start_setup)
     await send_or_edit(interaction, edit=edit, embed=embed, view=end_view)

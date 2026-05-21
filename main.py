@@ -151,6 +151,20 @@ async def on_ready() -> None:
         start_role_expire_task(client)
         start_pill_expire_task(client)
 
+    if not state._fishing_task_started:
+        state._fishing_task_started = True
+        from commands.fishing import (
+            cleanup_active_sessions_on_restart,
+            start_gift_expire_task,
+        )
+        await cleanup_active_sessions_on_restart()
+        start_gift_expire_task(client)
+
+    if not state._margin_task_started:
+        state._margin_task_started = True
+        from commands.stock import start_liquidation_task
+        start_liquidation_task()
+
     if not state._persistent_views_registered:
         state._persistent_views_registered = True
         from commands.daily_task import register_persistent_views
@@ -161,11 +175,23 @@ async def on_ready() -> None:
 
 
 @client.event
+async def on_interaction(interaction: discord.Interaction) -> None:
+    # 攔截 persistent gift accept/reject 按鈕 — bot 重啟後 view instance 已不在，
+    # 但 custom_id 帶 gift_id，仍可從 gifts.json 還原並處理。
+    if interaction.type == discord.InteractionType.component:
+        from commands.fishing import dispatch_gift_interaction
+        try:
+            await dispatch_gift_interaction(interaction)
+        except Exception as e:
+            print(f'[FISHING] gift dispatch error: {e}')
+
+
+@client.event
 async def on_message(msg: discord.Message) -> None:
     if msg.author == client.user:
         return
 
-    # 真心話藥丸：在所有處理前攔截被餵藥用戶的訊息（刪除 + 改寫 + webhook 重發）
+    # 調教項圈：在所有處理前攔截被戴項圈用戶的訊息（刪除 + 改寫 + webhook 重發）
     from commands.shop import maybe_apply_truth_pill
     if await maybe_apply_truth_pill(msg):
         return
@@ -196,9 +222,22 @@ async def on_message(msg: discord.Message) -> None:
     print(f'[MSG] ch={cid} [{personality}]: {raw_text[:80]}')
 
     # 用戶身分前綴：優先用商店「改名板」自訂名，否則用伺服器顯示名稱
-    from commands.shop import get_ai_nickname
+    # 格式：[ID:xxx 暱稱:xxx 真主人:Y/N]，配合 PERSONALITY 的身分鑑別硬規則使用
+    from commands.shop import get_ai_nickname, get_active_bot_persona
     display_name    = get_ai_nickname(str(msg.author.id)) or msg.author.display_name
-    identity_prefix = f'[用戶: {display_name}]\n'
+    identity_prefix = (
+        f'[ID:{msg.author.id} 暱稱:{display_name} '
+        f'真主人:{"Y" if is_master else "N"}]\n'
+    )
+
+    # 小龍喵項圈：當前用戶若有給小龍喵戴項圈，把它的 prompt 覆寫附加進去（只對自己生效）
+    if msg.guild is not None:
+        bot_persona = get_active_bot_persona(msg.guild.id, msg.author.id)
+        if bot_persona:
+            identity_prefix = (
+                f'[小龍喵當前人格覆寫｜只對 ID:{msg.author.id} 生效] {bot_persona}\n'
+                + identity_prefix
+            )
 
     prompt: str = raw_text if raw_text else '請描述這個附件的內容。'
 

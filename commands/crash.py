@@ -23,7 +23,10 @@ import discord
 from commands._setup import (
     EndOfGameView, insufficient_embed, make_bet_row, tier_label,
 )
-from commands._wallet import apply_delta, get_balance, send_or_edit, send_smart
+from commands._wallet import (
+    apply_delta, get_balance, send_or_edit, send_smart,
+    settle_with_streak, streak_line,
+)
 
 
 GAME_NAME   = '爆點 (Crash)'
@@ -104,17 +107,20 @@ def _running_embed(user: discord.abc.User, bet: int,
 
 
 def _cashed_embed(user: discord.abc.User, bet: int, mult: float,
-                  balance: int) -> discord.Embed:
+                  balance: int, streak: int = 0, bonus: int = 0) -> discord.Embed:
     payout   = int(bet * mult)
-    net      = payout - bet
+    net      = payout - bet + bonus
     sign     = f'+{net}' if net >= 0 else str(net)
     _, color = tier_label(payout, bet)
     desc = [
         '🚀💨💨💨', '',
         f'# 💰 提現 @ **{mult:.2f}x**', '',
-        f'投注 {bet}　取回 **{payout}**　淨 **{sign}**', '',
-        f'餘額：**{balance}** 咕嚕喵碎片',
+        f'投注 {bet}　取回 **{payout}**　淨 **{sign}**',
     ]
+    sl = streak_line(streak, bonus)
+    if sl:
+        desc.append(sl)
+    desc += ['', f'餘額：**{balance}** 咕嚕喵碎片']
     embed = discord.Embed(
         title=f'🚀 {GAME_NAME}　{sign}',
         description='\n'.join(desc), color=color,
@@ -158,8 +164,11 @@ class CrashGameView(discord.ui.View):
             return
         still_alive = await self.game.tick()
         if not still_alive:
-            balance = get_balance(self.uid)
-            embed   = _crashed_embed(
+            # 炸了：本金已扣，payout=0；streak 歸 0（無紅利）
+            balance, _, _ = await settle_with_streak(
+                self.uid, self.bet, 0, deducted=True,
+            )
+            embed = _crashed_embed(
                 interaction.user, self.bet, self.game.current, balance,
             )
             end_view = EndOfGameView(
@@ -187,10 +196,12 @@ class CrashGameView(discord.ui.View):
             )
             return
         payout = int(self.bet * m)
-        if payout > 0:
-            await apply_delta(self.uid, payout)
-        balance  = get_balance(self.uid)
-        embed    = _cashed_embed(interaction.user, self.bet, m, balance)
+        # 本金已扣，payout 為 gross 取回；連勝紅利在 settle_with_streak 內計算。
+        balance, streak, bonus = await settle_with_streak(
+            self.uid, self.bet, payout, deducted=True,
+        )
+        embed = _cashed_embed(interaction.user, self.bet, m, balance,
+                              streak, bonus)
         end_view = EndOfGameView(
             self.uid, self.bet, {}, run_round, start_setup,
         )
@@ -222,7 +233,7 @@ class CrashSetupView(discord.ui.View):
 
     def _build(self) -> None:
         self.clear_items()
-        for btn in make_bet_row(self, self._refresh, row=0):
+        for btn in make_bet_row(self, self._redraw, row=0):
             self.add_item(btn)
         start = discord.ui.Button(
             label='起飛', emoji='🚀',
@@ -231,7 +242,7 @@ class CrashSetupView(discord.ui.View):
         start.callback = self._start_cb
         self.add_item(start)
 
-    async def _refresh(self, interaction: discord.Interaction) -> None:
+    async def _redraw(self, interaction: discord.Interaction) -> None:
         self._build()
         await interaction.response.edit_message(
             embed=_setup_embed(interaction.user, self.bet), view=self,

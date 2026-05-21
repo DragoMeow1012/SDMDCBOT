@@ -22,6 +22,7 @@ from commands import (
     gamble,
     stock,
     shop,
+    fishing,
 )
 
 
@@ -43,3 +44,4 @@ def setup_all(tree: app_commands.CommandTree) -> None:
     gamble.setup(tree)
     stock.setup(tree)
     shop.setup(tree)
+    fishing.setup(tree)
