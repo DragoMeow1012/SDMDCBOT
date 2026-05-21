@@ -1920,8 +1920,8 @@ LUCK_POTION_II_LUCK:     int   = 8
 RADAR_PRICE:             int   = 2_000   # 物種雷達：未釣過物種 +50% 偏好
 RADAR_UNSEEN_BIAS:       float = 0.50    # 抽魚種時 50% 機率從「沒釣過」池抽
 LUCK_POTION_III_PRICE:   int   = 4_000   # 幸運藥水 III：特殊 tag 機率提升（隱藏實際數值）
-POTION_DURATION_MIN:     int   = 30      # 每瓶 / 每次 30 分
-POTION_STACK_CAP_MIN:    int   = 180     # 累計上限 3 小時
+POTION_DURATION_MIN:     int   = 30      # 每瓶 / 每次 30 分（同種累積，上限 3 小時）
+POTION_STACK_CAP_MIN:    int   = 180     # 同種藥水累計上限 3 小時
 
 # ── 特殊 tag（每次釣魚極低機率附帶） ────────────────────────────────────
 SPECIAL_TAGS: dict[str, float] = {

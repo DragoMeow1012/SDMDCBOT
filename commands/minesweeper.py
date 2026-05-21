@@ -240,7 +240,7 @@ def _crashed_embed(user: discord.abc.User, game: MinesGame,
 # ── 對局 view ────────────────────────────────────────────────────────────
 class MinesGameView(discord.ui.View):
     def __init__(self, uid: str, game: MinesGame):
-        super().__init__(timeout=600)
+        super().__init__(timeout=86400)
         self.uid  = uid
         self.game = game
         self._build()

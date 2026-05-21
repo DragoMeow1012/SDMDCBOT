@@ -54,7 +54,7 @@ except ImportError:
     _CURL_CFFI_AVAILABLE = False
 
 from utils.json_store import load_json, save_json_async
-from commands._wallet import apply_delta, get_balance
+from commands._wallet import WALLET_LOCK, apply_delta, get_balance
 
 
 # ── 頻道 ID ─────────────────────────────────────────────────────────────
@@ -67,6 +67,12 @@ _REPORTS_FILE = os.path.join('data', 'daily_share_reports.json')
 _BANS_FILE    = os.path.join('data', 'daily_share_bans.json')
 _COUNTER_FILE = os.path.join('data', 'daily_share_counter.json')
 _FAVS_FILE    = os.path.join('data', 'manga_favorites.json')
+
+# ── 多人並發保護：所有寫入這幾個 JSON 都統一過 lock ──────────────
+_BANS_LOCK    = asyncio.Lock()
+_REPORTS_LOCK = asyncio.Lock()
+_COUNTER_LOCK = asyncio.Lock()
+_FAVS_LOCK    = asyncio.Lock()
 
 # ── 獎勵設定 ────────────────────────────────────────────────────────────
 _TZ              = timezone(timedelta(hours=8))
@@ -312,21 +318,22 @@ def _today_share_count(uid: str) -> int:
 
 async def _claim_daily_share_reward(uid: str, optional_filled: int) -> tuple[int, int]:
     """原子操作：今日計數 +1，並把獎勵加進餘額。回 (nth, reward)。"""
-    data  = load_json(_WALLET_FILE)
-    users = data.setdefault('users', {})
-    rec   = users.setdefault(uid, {
-        'balance': 0, 'total_days': 0, 'streak': 0, 'last_day': None,
-    })
-    today = _today_key()
-    if rec.get('daily_share_day') != today:
-        rec['daily_share_day']   = today
-        rec['daily_share_count'] = 0
-    nth = int(rec.get('daily_share_count', 0)) + 1
-    rec['daily_share_count'] = nth
-    reward = _calc_reward(nth, optional_filled)
-    if reward > 0:
-        rec['balance'] = int(rec.get('balance', 0)) + reward
-    await save_json_async(_WALLET_FILE, data)
+    async with WALLET_LOCK:
+        data  = load_json(_WALLET_FILE)
+        users = data.setdefault('users', {})
+        rec   = users.setdefault(uid, {
+            'balance': 0, 'total_days': 0, 'streak': 0, 'last_day': None,
+        })
+        today = _today_key()
+        if rec.get('daily_share_day') != today:
+            rec['daily_share_day']   = today
+            rec['daily_share_count'] = 0
+        nth = int(rec.get('daily_share_count', 0)) + 1
+        rec['daily_share_count'] = nth
+        reward = _calc_reward(nth, optional_filled)
+        if reward > 0:
+            rec['balance'] = int(rec.get('balance', 0)) + reward
+        await save_json_async(_WALLET_FILE, data)
     return nth, reward
 
 
@@ -365,27 +372,29 @@ def _ban_status(uid: str) -> tuple[bool, str]:
 
 async def _set_ban(uid: str, *, btype: str, days: int | None,
                    by: int) -> dict:
-    data  = _load_bans()
-    now   = datetime.now(_TZ)
-    entry: dict[str, Any] = {
-        'type':  btype,
-        'by':    int(by),
-        'at':    now.isoformat(),
-        'until': None,
-    }
-    if btype == 'temp' and days:
-        entry['until'] = (now + timedelta(days=days)).isoformat()
-    data[uid] = entry
-    await _save_bans(data)
+    async with _BANS_LOCK:
+        data  = _load_bans()
+        now   = datetime.now(_TZ)
+        entry: dict[str, Any] = {
+            'type':  btype,
+            'by':    int(by),
+            'at':    now.isoformat(),
+            'until': None,
+        }
+        if btype == 'temp' and days:
+            entry['until'] = (now + timedelta(days=days)).isoformat()
+        data[uid] = entry
+        await _save_bans(data)
     return entry
 
 
 async def _remove_ban(uid: str) -> bool:
-    data = _load_bans()
-    if uid not in data:
-        return False
-    data.pop(uid, None)
-    await _save_bans(data)
+    async with _BANS_LOCK:
+        data = _load_bans()
+        if uid not in data:
+            return False
+        data.pop(uid, None)
+        await _save_bans(data)
     return True
 
 
@@ -428,10 +437,11 @@ _serial_lock = asyncio.Lock()
 async def _allocate_serial() -> int:
     """配置一個新的流水號。受 _serial_lock 保護，避免並發競態。"""
     async with _serial_lock:
-        data = load_json(_COUNTER_FILE) or {}
-        n = int(data.get('next', 1))
-        data['next'] = n + 1
-        await save_json_async(_COUNTER_FILE, data)
+        async with _COUNTER_LOCK:
+            data = load_json(_COUNTER_FILE) or {}
+            n = int(data.get('next', 1))
+            data['next'] = n + 1
+            await save_json_async(_COUNTER_FILE, data)
         return n
 
 
@@ -462,24 +472,25 @@ async def _register_share_record(*, message_id: int, sharer_id: int,
     """寫一筆分享紀錄。沒給 serial 就配一個新的，回最終 serial。"""
     if serial is None:
         serial = await _allocate_serial()
-    data = _load_reports()
-    data[str(message_id)] = {
-        'sharer_id':        int(sharer_id),
-        'site':             site,
-        'url':              url,
-        'title':            title,
-        'tag':              tag,
-        'rating':           rating,
-        'thumb':            thumb,
-        'reporters':        [],
-        'likers':           [],
-        'admin_message_id': None,
-        'serial':           int(serial),
-        'reward':           int(reward),
-        'status':           'active',  # active / deleted / released
-        'penalty_applied':  False,
-    }
-    await _save_reports(data)
+    async with _REPORTS_LOCK:
+        data = _load_reports()
+        data[str(message_id)] = {
+            'sharer_id':        int(sharer_id),
+            'site':             site,
+            'url':              url,
+            'title':            title,
+            'tag':              tag,
+            'rating':           rating,
+            'thumb':            thumb,
+            'reporters':        [],
+            'likers':           [],
+            'admin_message_id': None,
+            'serial':           int(serial),
+            'reward':           int(reward),
+            'status':           'active',  # active / deleted / released
+            'penalty_applied':  False,
+        }
+        await _save_reports(data)
     return int(serial)
 
 
@@ -489,15 +500,16 @@ async def _add_liker(message_id: int, liker_id: int) -> tuple[str, dict | None]:
        - 'duplicate' : 該人已按過讚
        - 'recorded'  : 成功 +1
     """
-    data  = _load_reports()
-    entry = data.get(str(message_id))
-    if entry is None:
-        return 'no_record', None
-    likers = entry.setdefault('likers', [])
-    if str(liker_id) in likers:
-        return 'duplicate', entry
-    likers.append(str(liker_id))
-    await _save_reports(data)
+    async with _REPORTS_LOCK:
+        data  = _load_reports()
+        entry = data.get(str(message_id))
+        if entry is None:
+            return 'no_record', None
+        likers = entry.setdefault('likers', [])
+        if str(liker_id) in likers:
+            return 'duplicate', entry
+        likers.append(str(liker_id))
+        await _save_reports(data)
     return 'recorded', entry
 
 
@@ -509,29 +521,31 @@ async def _add_reporter(message_id: int, reporter_id: int) -> tuple[str, dict | 
        - 'forward'      : 票數剛達閾值，呼叫端應立即轉送管理員
        - 'already_full' : 票數已經達到 / 超過閾值，已轉送過了
     """
-    data  = _load_reports()
-    entry = data.get(str(message_id))
-    if entry is None:
-        return 'no_record', None
-    if entry.get('admin_message_id') is not None:
-        return 'already_full', entry
-    reporters = entry.setdefault('reporters', [])
-    if str(reporter_id) in reporters:
-        return 'duplicate', entry
-    reporters.append(str(reporter_id))
-    await _save_reports(data)
+    async with _REPORTS_LOCK:
+        data  = _load_reports()
+        entry = data.get(str(message_id))
+        if entry is None:
+            return 'no_record', None
+        if entry.get('admin_message_id') is not None:
+            return 'already_full', entry
+        reporters = entry.setdefault('reporters', [])
+        if str(reporter_id) in reporters:
+            return 'duplicate', entry
+        reporters.append(str(reporter_id))
+        await _save_reports(data)
     if len(reporters) >= _REPORT_THRESHOLD:
         return 'forward', entry
     return 'recorded', entry
 
 
 async def _mark_forwarded(message_id: int, admin_message_id: int) -> None:
-    data  = _load_reports()
-    entry = data.get(str(message_id))
-    if entry is None:
-        return
-    entry['admin_message_id'] = int(admin_message_id)
-    await _save_reports(data)
+    async with _REPORTS_LOCK:
+        data  = _load_reports()
+        entry = data.get(str(message_id))
+        if entry is None:
+            return
+        entry['admin_message_id'] = int(admin_message_id)
+        await _save_reports(data)
 
 
 def _find_report_by_admin_msg(admin_message_id: int) -> tuple[str | None, dict | None]:
@@ -580,17 +594,18 @@ async def _apply_penalty(client: discord.Client, entry_key: str,
         await apply_delta(uid, -total)
 
     # 在 reports.json 同步標記，避免重扣
-    reports = _load_reports()
-    rec     = reports.get(entry_key)
-    if rec is not None:
-        rec['penalty_applied'] = True
-        rec['penalty'] = {
-            'reward':    reward,
-            'fine':      fine,
-            'net_worth': net_worth,
-            'at':        datetime.now(_TZ).isoformat(),
-        }
-        await _save_reports(reports)
+    async with _REPORTS_LOCK:
+        reports = _load_reports()
+        rec     = reports.get(entry_key)
+        if rec is not None:
+            rec['penalty_applied'] = True
+            rec['penalty'] = {
+                'reward':    reward,
+                'fine':      fine,
+                'net_worth': net_worth,
+                'at':        datetime.now(_TZ).isoformat(),
+            }
+            await _save_reports(reports)
     entry['penalty_applied'] = True  # 同步給呼叫端在用的 dict
 
     # 公開 @通知（_TARGET_CHANNEL_ID，作為下架的後續訊息）
@@ -613,14 +628,15 @@ async def _apply_penalty(client: discord.Client, entry_key: str,
 async def _mark_status(entry_key: str, status: str,
                        extra: dict | None = None) -> None:
     """更新一筆 entry 的 status（active / deleted / released）。"""
-    reports = _load_reports()
-    rec     = reports.get(entry_key)
-    if rec is None:
-        return
-    rec['status'] = status
-    if extra:
-        rec.update(extra)
-    await _save_reports(reports)
+    async with _REPORTS_LOCK:
+        reports = _load_reports()
+        rec     = reports.get(entry_key)
+        if rec is None:
+            return
+        rec['status'] = status
+        if extra:
+            rec.update(extra)
+        await _save_reports(reports)
 
 
 def _resolve_active_share_by_serial(serial: int) -> tuple[str | None, dict | None]:
@@ -875,27 +891,29 @@ async def _add_user_fav(uid: str, entry: dict) -> tuple[bool, str]:
     """加入收藏；若 url 已在清單中則回 False。新加的擺最前面（最新→最舊）。"""
     if not entry.get('url'):
         return False, '此卡片解析不到連結'
-    data = _load_favs()
-    users = data.setdefault('users', {})
-    arr = users.setdefault(uid, [])
-    if any(e.get('url') == entry['url'] for e in arr):
-        return False, '已經在收藏裡了'
-    arr.insert(0, entry)
-    # 上限 200 防止無限長
-    if len(arr) > 200:
-        del arr[200:]
-    await _save_favs(data)
+    async with _FAVS_LOCK:
+        data = _load_favs()
+        users = data.setdefault('users', {})
+        arr = users.setdefault(uid, [])
+        if any(e.get('url') == entry['url'] for e in arr):
+            return False, '已經在收藏裡了'
+        arr.insert(0, entry)
+        # 上限 200 防止無限長
+        if len(arr) > 200:
+            del arr[200:]
+        await _save_favs(data)
     return True, ''
 
 
 async def _remove_user_fav(uid: str, url: str) -> bool:
-    data = _load_favs()
-    arr = (data.get('users') or {}).get(uid) or []
-    new_arr = [e for e in arr if e.get('url') != url]
-    if len(new_arr) == len(arr):
-        return False
-    data.setdefault('users', {})[uid] = new_arr
-    await _save_favs(data)
+    async with _FAVS_LOCK:
+        data = _load_favs()
+        arr = (data.get('users') or {}).get(uid) or []
+        new_arr = [e for e in arr if e.get('url') != url]
+        if len(new_arr) == len(arr):
+            return False
+        data.setdefault('users', {})[uid] = new_arr
+        await _save_favs(data)
     return True
 
 
@@ -1556,13 +1574,14 @@ class DailyTaskHomeView(discord.ui.View):
         share_view.share_interaction = interaction
         try:
             await self.opener.delete_original_response()
+            self.stop()
         except discord.HTTPException:
             pass
 
 
 class DailyShareView(discord.ui.View):
     def __init__(self, uid: str):
-        super().__init__(timeout=600)
+        super().__init__(timeout=86400)
         self.uid: str = uid
         self.site: str | None = None
         self.share_interaction: discord.Interaction | None = None
@@ -1758,6 +1777,7 @@ class DailyShareModal(discord.ui.Modal, title='每日分享本子'):
         if share_inter is not None:
             try:
                 await share_inter.delete_original_response()
+                self.stop()
             except discord.HTTPException:
                 pass
 

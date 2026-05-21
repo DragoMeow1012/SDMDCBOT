@@ -50,6 +50,7 @@ import discord
 from discord import app_commands
 
 from utils.json_store import load_json, save_json_async
+from commands._wallet import WALLET_LOCK
 
 
 _FILE = os.path.join('data', 'morning_records.json')
@@ -748,53 +749,54 @@ class MorningView(discord.ui.View):
             )
             return
 
-        data        = load_json(_FILE)
-        users       = data.setdefault('users', {})
-        snap        = data.get('user_today', {}).get(self.uid)
-        rec         = users.get(self.uid)
-        day_key     = data.get('day_key', '')
-
-        if not snap or not rec or not day_key:
-            await interaction.response.send_message(
-                '找不到今天的打卡紀錄，請先 /早安小龍喵', ephemeral=True,
-            )
-            return
-
-        prev_last_day = snap.get('prev_last_day')
-        prev_streak   = int(snap.get('prev_streak', 0))
-        yesterday     = _yesterday_key(day_key)
-        two_days_ago  = _yesterday_key(yesterday)
-
-        if prev_last_day != two_days_ago:
-            if prev_last_day == yesterday:
-                msg = '你昨天本來就有打卡，不用補喔'
-            elif prev_last_day is None:
-                msg = '你之前沒打卡紀錄，沒得補'
-            else:
-                msg = '你已經斷超過一天了，補單一天救不回 streak ㄏㄏ'
-            await interaction.response.send_message(msg, ephemeral=True)
-            return
-
-        balance = int(rec.get('balance', 0))
-        if balance < _MAKEUP_COST:
-            await interaction.response.send_message(
-                f'餘額不足，補簽需要 {_MAKEUP_COST} 碎片，你只有 {balance}',
-                ephemeral=True,
-            )
-            return
-
-        # 套用補簽：扣費、累計+1、streak 復原為 prev_streak + 2
-        # (prev_streak 是 2 天前的 streak；補上昨天 +1，再算今天 +1)
-        rec['balance']    = balance - _MAKEUP_COST
-        rec['total_days'] = int(rec.get('total_days', 0)) + 1
-        rec['streak']     = prev_streak + 2
-
-        snap['total_days']    = rec['total_days']
-        snap['streak']        = rec['streak']
-        snap['prev_last_day'] = yesterday    # 再按一次會被擋掉
-        snap['prev_streak']   = prev_streak + 1
-
-        await save_json_async(_FILE, data)
+        async with WALLET_LOCK:
+            data        = load_json(_FILE)
+            users       = data.setdefault('users', {})
+            snap        = data.get('user_today', {}).get(self.uid)
+            rec         = users.get(self.uid)
+            day_key     = data.get('day_key', '')
+    
+            if not snap or not rec or not day_key:
+                await interaction.response.send_message(
+                    '找不到今天的打卡紀錄，請先 /早安小龍喵', ephemeral=True,
+                )
+                return
+    
+            prev_last_day = snap.get('prev_last_day')
+            prev_streak   = int(snap.get('prev_streak', 0))
+            yesterday     = _yesterday_key(day_key)
+            two_days_ago  = _yesterday_key(yesterday)
+    
+            if prev_last_day != two_days_ago:
+                if prev_last_day == yesterday:
+                    msg = '你昨天本來就有打卡，不用補喔'
+                elif prev_last_day is None:
+                    msg = '你之前沒打卡紀錄，沒得補'
+                else:
+                    msg = '你已經斷超過一天了，補單一天救不回 streak ㄏㄏ'
+                await interaction.response.send_message(msg, ephemeral=True)
+                return
+    
+            balance = int(rec.get('balance', 0))
+            if balance < _MAKEUP_COST:
+                await interaction.response.send_message(
+                    f'餘額不足，補簽需要 {_MAKEUP_COST} 碎片，你只有 {balance}',
+                    ephemeral=True,
+                )
+                return
+    
+            # 套用補簽：扣費、累計+1、streak 復原為 prev_streak + 2
+            # (prev_streak 是 2 天前的 streak；補上昨天 +1，再算今天 +1)
+            rec['balance']    = balance - _MAKEUP_COST
+            rec['total_days'] = int(rec.get('total_days', 0)) + 1
+            rec['streak']     = prev_streak + 2
+    
+            snap['total_days']    = rec['total_days']
+            snap['streak']        = rec['streak']
+            snap['prev_last_day'] = yesterday    # 再按一次會被擋掉
+            snap['prev_streak']   = prev_streak + 1
+    
+            await save_json_async(_FILE, data)
 
         # 重繪 embed：guild_rank 由 snap.guild_id 反查
         gid         = snap.get('guild_id', '')
@@ -842,33 +844,34 @@ class TransferView(discord.ui.View):
         if not await self._only_recipient(interaction):
             return
 
-        data   = load_json(_FILE)
-        users  = data.setdefault('users', {})
-        sender = users.get(self.sender_id)
-        if not sender or int(sender.get('balance', 0)) < self.amount:
-            self._disable_all()
-            await interaction.response.edit_message(
-                content=None,
-                embed=discord.Embed(
-                    title='❌ 轉帳失敗',
-                    description='發送方餘額不足',
-                    color=discord.Color.red(),
-                ),
-                view=self,
-            )
-            self.stop()
-            return
-
-        recipient = users.setdefault(self.recipient_id, {
-            'balance':    0,
-            'total_days': 0,
-            'streak':     0,
-            'last_day':   None,
-        })
-        sender['balance']    = int(sender.get('balance', 0)) - self.amount
-        recipient['balance'] = int(recipient.get('balance', 0)) + self.amount
-
-        await save_json_async(_FILE, data)
+        async with WALLET_LOCK:
+            data   = load_json(_FILE)
+            users  = data.setdefault('users', {})
+            sender = users.get(self.sender_id)
+            if not sender or int(sender.get('balance', 0)) < self.amount:
+                self._disable_all()
+                await interaction.response.edit_message(
+                    content=None,
+                    embed=discord.Embed(
+                        title='❌ 轉帳失敗',
+                        description='發送方餘額不足',
+                        color=discord.Color.red(),
+                    ),
+                    view=self,
+                )
+                self.stop()
+                return
+    
+            recipient = users.setdefault(self.recipient_id, {
+                'balance':    0,
+                'total_days': 0,
+                'streak':     0,
+                'last_day':   None,
+            })
+            sender['balance']    = int(sender.get('balance', 0)) - self.amount
+            recipient['balance'] = int(recipient.get('balance', 0)) + self.amount
+    
+            await save_json_async(_FILE, data)
 
         self._disable_all()
         await interaction.response.edit_message(
@@ -930,103 +933,104 @@ def setup(tree: app_commands.CommandTree) -> None:
 
         day_key = _signin_day_key(now)
 
-        data = load_json(_FILE)
-        _ensure_today(data, day_key)
-
-        users        = data.setdefault('users', {})
-        user_today   = data['user_today']
-        global_order = data['global_order']
-        guilds_order = data['guilds_order']
-
-        uid = str(interaction.user.id)
-        gid = str(guild.id)
-
-        guild_order   = guilds_order.setdefault(gid, [])
-        gid_count_map = data['guild_signin_count'].setdefault(gid, {})
-        prev_count    = int(gid_count_map.get(uid, 0))
-        gid_count_map[uid] = prev_count + 1
-
-        is_same_guild_repeat = prev_count >= 1
-        is_new_today         = uid not in user_today
-
-        if is_new_today:
-            title, greeting, extras, color = _period_info(now)
-            extra_line = random.choice(extras) if extras else ''
-
-            global_order.append(uid)
-            if uid not in guild_order:
-                guild_order.append(uid)
-
-            user_rec = users.setdefault(uid, {
-                'balance':    0,
-                'total_days': 0,
-                'streak':     0,
-                'last_day':   None,
-            })
-            # 保留打卡前的 last_day / streak，給補簽按鈕判斷與還原 streak 用
-            prev_last_day = user_rec.get('last_day')
-            prev_streak   = int(user_rec.get('streak', 0))
-            if prev_last_day == _yesterday_key(day_key):
-                user_rec['streak'] = prev_streak + 1
-            else:
-                user_rec['streak'] = 1
-            user_rec['total_days'] = int(user_rec.get('total_days', 0)) + 1
-            user_rec['last_day']   = day_key
-
-            coin = random.randint(1000, 6000)
-            user_rec['balance'] = int(user_rec.get('balance', 0)) + coin
-
-            lucky, soup, whisper = await asyncio.gather(
-                _generate_lucky_item(), _generate_soup(), _generate_whisper(),
+        async with WALLET_LOCK:
+            data = load_json(_FILE)
+            _ensure_today(data, day_key)
+    
+            users        = data.setdefault('users', {})
+            user_today   = data['user_today']
+            global_order = data['global_order']
+            guilds_order = data['guilds_order']
+    
+            uid = str(interaction.user.id)
+            gid = str(guild.id)
+    
+            guild_order   = guilds_order.setdefault(gid, [])
+            gid_count_map = data['guild_signin_count'].setdefault(gid, {})
+            prev_count    = int(gid_count_map.get(uid, 0))
+            gid_count_map[uid] = prev_count + 1
+    
+            is_same_guild_repeat = prev_count >= 1
+            is_new_today         = uid not in user_today
+    
+            if is_new_today:
+                title, greeting, extras, color = _period_info(now)
+                extra_line = random.choice(extras) if extras else ''
+    
+                global_order.append(uid)
+                if uid not in guild_order:
+                    guild_order.append(uid)
+    
+                user_rec = users.setdefault(uid, {
+                    'balance':    0,
+                    'total_days': 0,
+                    'streak':     0,
+                    'last_day':   None,
+                })
+                # 保留打卡前的 last_day / streak，給補簽按鈕判斷與還原 streak 用
+                prev_last_day = user_rec.get('last_day')
+                prev_streak   = int(user_rec.get('streak', 0))
+                if prev_last_day == _yesterday_key(day_key):
+                    user_rec['streak'] = prev_streak + 1
+                else:
+                    user_rec['streak'] = 1
+                user_rec['total_days'] = int(user_rec.get('total_days', 0)) + 1
+                user_rec['last_day']   = day_key
+    
+                coin = random.randint(1000, 6000)
+                user_rec['balance'] = int(user_rec.get('balance', 0)) + coin
+    
+                lucky, soup, whisper = await asyncio.gather(
+                    _generate_lucky_item(), _generate_soup(), _generate_whisper(),
+                )
+    
+                money_luck = random.randint(0, 150)
+                love_luck  = random.randint(0, 150)
+                work_luck  = random.randint(0, 150)
+                ratio      = (money_luck + love_luck + work_luck) / 450.0
+                fortune_name = _fortune_from_ratio(ratio)
+                stars        = round(ratio * 10, 1)
+    
+                user_today[uid] = {
+                    'signin_time':   _format_signin_time(now),
+                    'global_rank':   len(global_order),
+                    'lucky_item':    lucky,
+                    'soup':          soup,
+                    'whisper':       whisper,
+                    'coin':          coin,
+                    'money_luck':    money_luck,
+                    'love_luck':     love_luck,
+                    'work_luck':     work_luck,
+                    'fortune_name':  fortune_name,
+                    'stars':         stars,
+                    'total_days':    user_rec['total_days'],
+                    'streak':        user_rec['streak'],
+                    'title':         title,
+                    'greeting':      greeting,
+                    'extra_line':    extra_line,
+                    'color':         color.value,
+                    'guild_id':      gid,
+                    'prev_last_day': prev_last_day,
+                    'prev_streak':   prev_streak,
+                }
+            elif not is_same_guild_repeat:
+                # 別群第一次：加入該群順序，不領獎
+                if uid not in guild_order:
+                    guild_order.append(uid)
+    
+            today_snapshot = user_today[uid]
+            guild_rank     = guild_order.index(uid) + 1 if uid in guild_order else len(guild_order)
+            balance        = int(users.get(uid, {}).get('balance', 0))
+    
+            embed = _build_embed(
+                today_snapshot,
+                guild_rank,
+                display_name=interaction.user.display_name,
+                balance=balance,
             )
-
-            money_luck = random.randint(0, 150)
-            love_luck  = random.randint(0, 150)
-            work_luck  = random.randint(0, 150)
-            ratio      = (money_luck + love_luck + work_luck) / 450.0
-            fortune_name = _fortune_from_ratio(ratio)
-            stars        = round(ratio * 10, 1)
-
-            user_today[uid] = {
-                'signin_time':   _format_signin_time(now),
-                'global_rank':   len(global_order),
-                'lucky_item':    lucky,
-                'soup':          soup,
-                'whisper':       whisper,
-                'coin':          coin,
-                'money_luck':    money_luck,
-                'love_luck':     love_luck,
-                'work_luck':     work_luck,
-                'fortune_name':  fortune_name,
-                'stars':         stars,
-                'total_days':    user_rec['total_days'],
-                'streak':        user_rec['streak'],
-                'title':         title,
-                'greeting':      greeting,
-                'extra_line':    extra_line,
-                'color':         color.value,
-                'guild_id':      gid,
-                'prev_last_day': prev_last_day,
-                'prev_streak':   prev_streak,
-            }
-        elif not is_same_guild_repeat:
-            # 別群第一次：加入該群順序，不領獎
-            if uid not in guild_order:
-                guild_order.append(uid)
-
-        today_snapshot = user_today[uid]
-        guild_rank     = guild_order.index(uid) + 1 if uid in guild_order else len(guild_order)
-        balance        = int(users.get(uid, {}).get('balance', 0))
-
-        embed = _build_embed(
-            today_snapshot,
-            guild_rank,
-            display_name=interaction.user.display_name,
-            balance=balance,
-        )
-        content = '_今天已經打卡過了，這是你今天的紀錄～_' if is_same_guild_repeat else None
-
-        await save_json_async(_FILE, data)
+            content = '_今天已經打卡過了，這是你今天的紀錄～_' if is_same_guild_repeat else None
+    
+            await save_json_async(_FILE, data)
         await interaction.followup.send(
             content=content, embed=embed, view=MorningView(uid),
         )

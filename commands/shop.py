@@ -13,6 +13,7 @@ UI 流程：
     │   讓存提款 modal 提交後正確刷新 E_main）
     │
     └─ ✖️ 關閉商店 → delete_original_response 移除 E_main
+    self.stop()
 
 商品：
   - 礦工 (10 萬碎片 / 台，可重複，上限 10 台)
@@ -56,7 +57,7 @@ from datetime import datetime, timedelta
 import discord
 from discord import app_commands
 
-from commands._wallet import apply_delta, get_balance
+from commands._wallet import WALLET_LOCK, apply_delta, get_balance
 from utils.json_store import load_json, save_json_async
 
 
@@ -102,21 +103,22 @@ async def _atomic_buy(uid: str, n: int) -> tuple[bool, str, int, int]:
 
     回傳 (success, error_msg, new_balance, new_miners)。
     """
-    data  = load_json(_WALLET_FILE)
-    users = data.setdefault('users', {})
-    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
-    cur_miners  = int(rec.get('miners', 0))
-    cur_balance = int(rec.get('balance', 0))
-    cost        = MINER_PRICE * n
-    if n <= 0:
-        return False, '購買數量必須為正', cur_balance, cur_miners
-    if cur_miners + n > MINER_CAP:
-        return False, f'已達持有上限 {MINER_CAP} 台', cur_balance, cur_miners
-    if cur_balance < cost:
-        return False, f'餘額不足，需要 {cost:,}（你有 {cur_balance:,}）', cur_balance, cur_miners
-    rec['balance'] = cur_balance - cost
-    rec['miners']  = cur_miners + n
-    await save_json_async(_WALLET_FILE, data)
+    async with WALLET_LOCK:
+        data  = load_json(_WALLET_FILE)
+        users = data.setdefault('users', {})
+        rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+        cur_miners  = int(rec.get('miners', 0))
+        cur_balance = int(rec.get('balance', 0))
+        cost        = MINER_PRICE * n
+        if n <= 0:
+            return False, '購買數量必須為正', cur_balance, cur_miners
+        if cur_miners + n > MINER_CAP:
+            return False, f'已達持有上限 {MINER_CAP} 台', cur_balance, cur_miners
+        if cur_balance < cost:
+            return False, f'餘額不足，需要 {cost:,}（你有 {cur_balance:,}）', cur_balance, cur_miners
+        rec['balance'] = cur_balance - cost
+        rec['miners']  = cur_miners + n
+        await save_json_async(_WALLET_FILE, data)
     return True, '', rec['balance'], rec['miners']
 
 
@@ -129,40 +131,43 @@ def _has_claimed_free_miner(uid: str) -> bool:
 async def _atomic_claim_free_miner(uid: str) -> tuple[bool, str, int]:
     """每位用戶限領一次的免費礦工：rec['miner_free_claimed']=True 記號永久保留。
     回 (success, error_msg, new_miners)。"""
-    data  = load_json(_WALLET_FILE)
-    users = data.setdefault('users', {})
-    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
-    if rec.get('miner_free_claimed'):
-        return False, '你已經領過免費礦工了喵', int(rec.get('miners', 0))
-    cur_miners = int(rec.get('miners', 0))
-    if cur_miners >= MINER_CAP:
-        return False, f'已達持有上限 {MINER_CAP} 台，無法再領取', cur_miners
-    rec['miners'] = cur_miners + 1
-    rec['miner_free_claimed'] = True
-    await save_json_async(_WALLET_FILE, data)
+    async with WALLET_LOCK:
+        data  = load_json(_WALLET_FILE)
+        users = data.setdefault('users', {})
+        rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+        if rec.get('miner_free_claimed'):
+            return False, '你已經領過免費礦工了喵', int(rec.get('miners', 0))
+        cur_miners = int(rec.get('miners', 0))
+        if cur_miners >= MINER_CAP:
+            return False, f'已達持有上限 {MINER_CAP} 台，無法再領取', cur_miners
+        rec['miners'] = cur_miners + 1
+        rec['miner_free_claimed'] = True
+        await save_json_async(_WALLET_FILE, data)
     return True, '', rec['miners']
 
 
 # ── 資料存取 (錢包通用扣 / 退款) ─────────────────────────────────────────
 async def _atomic_deduct(uid: str, amount: int) -> tuple[bool, str, int]:
     """從餘額扣指定數量，原子寫入。回 (success, error_msg, new_balance)。"""
-    data  = load_json(_WALLET_FILE)
-    users = data.setdefault('users', {})
-    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
-    cur_balance = int(rec.get('balance', 0))
-    if cur_balance < amount:
-        return False, f'餘額不足，需要 {amount:,}（你有 {cur_balance:,}）', cur_balance
-    rec['balance'] = cur_balance - amount
-    await save_json_async(_WALLET_FILE, data)
+    async with WALLET_LOCK:
+        data  = load_json(_WALLET_FILE)
+        users = data.setdefault('users', {})
+        rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+        cur_balance = int(rec.get('balance', 0))
+        if cur_balance < amount:
+            return False, f'餘額不足，需要 {amount:,}（你有 {cur_balance:,}）', cur_balance
+        rec['balance'] = cur_balance - amount
+        await save_json_async(_WALLET_FILE, data)
     return True, '', rec['balance']
 
 
 async def _refund(uid: str, amount: int) -> None:
-    data  = load_json(_WALLET_FILE)
-    users = data.setdefault('users', {})
-    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
-    rec['balance'] = int(rec.get('balance', 0)) + amount
-    await save_json_async(_WALLET_FILE, data)
+    async with WALLET_LOCK:
+        data  = load_json(_WALLET_FILE)
+        users = data.setdefault('users', {})
+        rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+        rec['balance'] = int(rec.get('balance', 0)) + amount
+        await save_json_async(_WALLET_FILE, data)
 
 
 # ── 資料存取 (能量藥水) ─────────────────────────────────────────────────
@@ -217,21 +222,22 @@ async def _atomic_buy_potion(uid: str, tier: str = 'a') -> tuple[bool, str, int,
     cfg = _POTION_TIERS[tier]
     price = cfg['price']
     field = cfg['field']
-    data  = load_json(_WALLET_FILE)
-    users = data.setdefault('users', {})
-    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
-    cur_balance = int(rec.get('balance', 0))
-    if cur_balance < price:
-        return (False,
-                f'餘額不足，需要 {price:,}（你有 {cur_balance:,}）',
-                cur_balance, None)
-    now      = datetime.now()
-    cur_exp  = _tier_until(rec, tier)
-    base     = cur_exp if (cur_exp and cur_exp > now) else now
-    new_exp  = base + timedelta(hours=POTION_DURATION_HOURS)
-    rec['balance'] = cur_balance - price
-    rec[field]     = new_exp.isoformat()
-    await save_json_async(_WALLET_FILE, data)
+    async with WALLET_LOCK:
+        data  = load_json(_WALLET_FILE)
+        users = data.setdefault('users', {})
+        rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+        cur_balance = int(rec.get('balance', 0))
+        if cur_balance < price:
+            return (False,
+                    f'餘額不足，需要 {price:,}（你有 {cur_balance:,}）',
+                    cur_balance, None)
+        now      = datetime.now()
+        cur_exp  = _tier_until(rec, tier)
+        base     = cur_exp if (cur_exp and cur_exp > now) else now
+        new_exp  = base + timedelta(hours=POTION_DURATION_HOURS)
+        rec['balance'] = cur_balance - price
+        rec[field]     = new_exp.isoformat()
+        await save_json_async(_WALLET_FILE, data)
     return True, '', rec['balance'], new_exp
 
 
@@ -679,28 +685,29 @@ async def _purchase_custom_role(guild: discord.Guild, member: discord.Member,
 async def _payout_once() -> None:
     now   = datetime.now()
     today = now.date().isoformat()
-    data  = load_json(_WALLET_FILE)
-    users = data.get('users', {})
-    paid_count = 0
-    total_paid = 0
-    for rec in users.values():
-        n = int(rec.get('miners', 0))
-        if n <= 0:
-            continue
-        base_gain = sum(random.randint(MINER_MIN, MINER_MAX) for _ in range(n))
-        # 三瓶藥水獨立計時，取目前最高有效倍率（floor）
-        mult = _active_potion_multiplier(rec, now)
-        gain = int(base_gain * mult) if mult > 1.0 else base_gain
-        rec['balance'] = int(rec.get('balance', 0)) + gain
-        # 累積當日收益供 /查看帳戶餘額 顯示；跨日歸零
-        if rec.get('miner_gain_day') != today:
-            rec['miner_gain_day']  = today
-            rec['miner_today_gain'] = 0
-        rec['miner_today_gain'] = int(rec.get('miner_today_gain', 0)) + gain
-        paid_count += 1
-        total_paid += gain
-    if paid_count > 0:
-        await save_json_async(_WALLET_FILE, data)
+    async with WALLET_LOCK:
+        data  = load_json(_WALLET_FILE)
+        users = data.get('users', {})
+        paid_count = 0
+        total_paid = 0
+        for rec in users.values():
+            n = int(rec.get('miners', 0))
+            if n <= 0:
+                continue
+            base_gain = sum(random.randint(MINER_MIN, MINER_MAX) for _ in range(n))
+            # 三瓶藥水獨立計時，取目前最高有效倍率（floor）
+            mult = _active_potion_multiplier(rec, now)
+            gain = int(base_gain * mult) if mult > 1.0 else base_gain
+            rec['balance'] = int(rec.get('balance', 0)) + gain
+            # 累積當日收益供 /查看帳戶餘額 顯示；跨日歸零
+            if rec.get('miner_gain_day') != today:
+                rec['miner_gain_day']  = today
+                rec['miner_today_gain'] = 0
+            rec['miner_today_gain'] = int(rec.get('miner_today_gain', 0)) + gain
+            paid_count += 1
+            total_paid += gain
+        if paid_count > 0:
+            await save_json_async(_WALLET_FILE, data)
     print(f'[MINER] 整點派發完成: {paid_count} 位玩家共 {total_paid} 碎片')
 
 
@@ -794,31 +801,33 @@ def get_reverse_cards(uid: str) -> int:
 
 async def _atomic_buy_reverse_card(uid: str) -> tuple[bool, str, int, int]:
     """扣錢 + 反轉牌 +1（上限 REVERSE_CARD_MAX）。"""
-    data  = load_json(_WALLET_FILE)
-    users = data.setdefault('users', {})
-    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
-    cur_cards   = int(rec.get('reverse_cards', 0))
-    cur_balance = int(rec.get('balance', 0))
-    if cur_cards >= REVERSE_CARD_MAX:
-        return False, f'已達持有上限 {REVERSE_CARD_MAX} 張', cur_balance, cur_cards
-    if cur_balance < REVERSE_CARD_PRICE:
-        return False, f'餘額不足，需要 {REVERSE_CARD_PRICE:,}（你有 {cur_balance:,}）', cur_balance, cur_cards
-    rec['balance']       = cur_balance - REVERSE_CARD_PRICE
-    rec['reverse_cards'] = cur_cards + 1
-    await save_json_async(_WALLET_FILE, data)
+    async with WALLET_LOCK:
+        data  = load_json(_WALLET_FILE)
+        users = data.setdefault('users', {})
+        rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+        cur_cards   = int(rec.get('reverse_cards', 0))
+        cur_balance = int(rec.get('balance', 0))
+        if cur_cards >= REVERSE_CARD_MAX:
+            return False, f'已達持有上限 {REVERSE_CARD_MAX} 張', cur_balance, cur_cards
+        if cur_balance < REVERSE_CARD_PRICE:
+            return False, f'餘額不足，需要 {REVERSE_CARD_PRICE:,}（你有 {cur_balance:,}）', cur_balance, cur_cards
+        rec['balance']       = cur_balance - REVERSE_CARD_PRICE
+        rec['reverse_cards'] = cur_cards + 1
+        await save_json_async(_WALLET_FILE, data)
     return True, '', rec['balance'], rec['reverse_cards']
 
 
 async def _consume_reverse_card(uid: str) -> bool:
     """嘗試消耗一張反轉牌，成功回 True。"""
-    data  = load_json(_WALLET_FILE)
-    users = data.setdefault('users', {})
-    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
-    n = int(rec.get('reverse_cards', 0))
-    if n <= 0:
-        return False
-    rec['reverse_cards'] = n - 1
-    await save_json_async(_WALLET_FILE, data)
+    async with WALLET_LOCK:
+        data  = load_json(_WALLET_FILE)
+        users = data.setdefault('users', {})
+        rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+        n = int(rec.get('reverse_cards', 0))
+        if n <= 0:
+            return False
+        rec['reverse_cards'] = n - 1
+        await save_json_async(_WALLET_FILE, data)
     return True
 
 
@@ -1195,11 +1204,12 @@ async def _purchase_truth_pill(
                     buyer_member = await guild.fetch_member(int(buyer_uid))
                 except (discord.NotFound, discord.HTTPException):
                     # 反彈目標不在伺服器：把吞掉的反轉牌補回去
-                    data  = load_json(_WALLET_FILE)
-                    users = data.setdefault('users', {})
-                    rec   = users.setdefault(str(target_id), dict(_DEFAULT_REC))
-                    rec['reverse_cards'] = int(rec.get('reverse_cards', 0)) + 1
-                    await save_json_async(_WALLET_FILE, data)
+                    async with WALLET_LOCK:
+                        data  = load_json(_WALLET_FILE)
+                        users = data.setdefault('users', {})
+                        rec   = users.setdefault(str(target_id), dict(_DEFAULT_REC))
+                        rec['reverse_cards'] = int(rec.get('reverse_cards', 0)) + 1
+                        await save_json_async(_WALLET_FILE, data)
                     return False, '❌ 反轉牌觸發但 buyer 不在伺服器，購買中止', False
             final_target = buyer_member
             final_target_id = int(buyer_uid)
@@ -1443,6 +1453,7 @@ class TruthPillShopView(discord.ui.View):
         await interaction.response.edit_message(
             embed=_antidote_embed(interaction.user), view=view,
         )
+        self.stop()
 
     async def _back_cb(self, interaction: discord.Interaction) -> None:
         if str(interaction.user.id) != self.uid:
@@ -1567,6 +1578,7 @@ class TruthPillModal(discord.ui.Modal, title='設定調教項圈竄改規則'):
         if parent_shop.button_interaction is not None:
             try:
                 await parent_shop.button_interaction.delete_original_response()
+                self.stop()
             except discord.HTTPException:
                 pass
         try:
@@ -1898,15 +1910,16 @@ def get_ai_nickname(uid: str) -> str:
 
 async def _atomic_buy_nickname(uid: str, new_name: str) -> tuple[bool, str, int]:
     """扣錢 + 寫入 ai_nickname。每次改名都要付 NICKNAME_PRICE。"""
-    data  = load_json(_WALLET_FILE)
-    users = data.setdefault('users', {})
-    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
-    cur_balance = int(rec.get('balance', 0))
-    if cur_balance < NICKNAME_PRICE:
-        return False, f'餘額不足，需要 {NICKNAME_PRICE:,}（你有 {cur_balance:,}）', cur_balance
-    rec['balance']     = cur_balance - NICKNAME_PRICE
-    rec['ai_nickname'] = new_name
-    await save_json_async(_WALLET_FILE, data)
+    async with WALLET_LOCK:
+        data  = load_json(_WALLET_FILE)
+        users = data.setdefault('users', {})
+        rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+        cur_balance = int(rec.get('balance', 0))
+        if cur_balance < NICKNAME_PRICE:
+            return False, f'餘額不足，需要 {NICKNAME_PRICE:,}（你有 {cur_balance:,}）', cur_balance
+        rec['balance']     = cur_balance - NICKNAME_PRICE
+        rec['ai_nickname'] = new_name
+        await save_json_async(_WALLET_FILE, data)
     return True, '', rec['balance']
 
 
@@ -2022,32 +2035,34 @@ async def _atomic_sell_miner(uid: str, n: int) -> tuple[bool, str, int]:
     """礦工 -n，餘額 +n*MINER_SELL_PRICE。原子寫入。"""
     if n <= 0:
         return False, '數量必須為正', 0
-    data  = load_json(_WALLET_FILE)
-    users = data.setdefault('users', {})
-    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
-    cur_miners = int(rec.get('miners', 0))
-    if cur_miners < n:
-        return False, f'礦工不足（持有 {cur_miners}）', 0
-    gain = MINER_SELL_PRICE * n
-    rec['miners']  = cur_miners - n
-    rec['balance'] = int(rec.get('balance', 0)) + gain
-    await save_json_async(_WALLET_FILE, data)
+    async with WALLET_LOCK:
+        data  = load_json(_WALLET_FILE)
+        users = data.setdefault('users', {})
+        rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+        cur_miners = int(rec.get('miners', 0))
+        if cur_miners < n:
+            return False, f'礦工不足（持有 {cur_miners}）', 0
+        gain = MINER_SELL_PRICE * n
+        rec['miners']  = cur_miners - n
+        rec['balance'] = int(rec.get('balance', 0)) + gain
+        await save_json_async(_WALLET_FILE, data)
     return True, '', gain
 
 
 async def _atomic_sell_reverse(uid: str, n: int) -> tuple[bool, str, int]:
     if n <= 0:
         return False, '數量必須為正', 0
-    data  = load_json(_WALLET_FILE)
-    users = data.setdefault('users', {})
-    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
-    cur = int(rec.get('reverse_cards', 0))
-    if cur < n:
-        return False, f'反轉牌不足（持有 {cur}）', 0
-    gain = REVERSE_SELL_PRICE * n
-    rec['reverse_cards'] = cur - n
-    rec['balance'] = int(rec.get('balance', 0)) + gain
-    await save_json_async(_WALLET_FILE, data)
+    async with WALLET_LOCK:
+        data  = load_json(_WALLET_FILE)
+        users = data.setdefault('users', {})
+        rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+        cur = int(rec.get('reverse_cards', 0))
+        if cur < n:
+            return False, f'反轉牌不足（持有 {cur}）', 0
+        gain = REVERSE_SELL_PRICE * n
+        rec['reverse_cards'] = cur - n
+        rec['balance'] = int(rec.get('balance', 0)) + gain
+        await save_json_async(_WALLET_FILE, data)
     return True, '', gain
 
 
@@ -2059,28 +2074,30 @@ def _has_reverse(uid: str) -> int:
 async def _atomic_add_reverse(uid: str, n: int) -> tuple[bool, str]:
     if n <= 0:
         return False, '數量必須為正'
-    data  = load_json(_WALLET_FILE)
-    users = data.setdefault('users', {})
-    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
-    cur   = int(rec.get('reverse_cards', 0))
-    if cur + n > REVERSE_CARD_MAX:
-        return False, f'反轉牌已滿（上限 {REVERSE_CARD_MAX}）'
-    rec['reverse_cards'] = cur + n
-    await save_json_async(_WALLET_FILE, data)
+    async with WALLET_LOCK:
+        data  = load_json(_WALLET_FILE)
+        users = data.setdefault('users', {})
+        rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+        cur   = int(rec.get('reverse_cards', 0))
+        if cur + n > REVERSE_CARD_MAX:
+            return False, f'反轉牌已滿（上限 {REVERSE_CARD_MAX}）'
+        rec['reverse_cards'] = cur + n
+        await save_json_async(_WALLET_FILE, data)
     return True, ''
 
 
 async def _atomic_add_miner(uid: str, n: int) -> tuple[bool, str]:
     if n <= 0:
         return False, '數量必須為正'
-    data  = load_json(_WALLET_FILE)
-    users = data.setdefault('users', {})
-    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
-    cur   = int(rec.get('miners', 0))
-    if cur + n > MINER_CAP:
-        return False, f'礦工已達上限 {MINER_CAP} 台'
-    rec['miners'] = cur + n
-    await save_json_async(_WALLET_FILE, data)
+    async with WALLET_LOCK:
+        data  = load_json(_WALLET_FILE)
+        users = data.setdefault('users', {})
+        rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+        cur   = int(rec.get('miners', 0))
+        if cur + n > MINER_CAP:
+            return False, f'礦工已達上限 {MINER_CAP} 台'
+        rec['miners'] = cur + n
+        await save_json_async(_WALLET_FILE, data)
     return True, ''
 
 
@@ -2213,6 +2230,7 @@ class ShopFishingEquipView(discord.ui.View):
         await interaction.response.edit_message(
             embed=view.build_embed(interaction.user), view=view,
         )
+        self.stop()
 
     async def _goto_bait(self, interaction: discord.Interaction) -> None:
         if not await self._check(interaction):
@@ -2224,6 +2242,7 @@ class ShopFishingEquipView(discord.ui.View):
         await interaction.response.edit_message(
             embed=view.build_embed(interaction.user), view=view,
         )
+        self.stop()
 
     async def _expand_pond(self, interaction: discord.Interaction) -> None:
         if not await self._check(interaction):
@@ -2235,6 +2254,7 @@ class ShopFishingEquipView(discord.ui.View):
         await interaction.response.edit_message(
             embed=new.build_embed(interaction.user), view=new,
         )
+        self.stop()
         msg = (f'✅ 已擴充保溫箱，目前上限 **{new_cap}** 條'
                if ok else f'❌ {err}')
         try:
@@ -2248,6 +2268,7 @@ class ShopFishingEquipView(discord.ui.View):
         await interaction.response.edit_message(
             embed=new.build_embed(interaction.user), view=new,
         )
+        self.stop()
         if ok:
             ts = f'<t:{int(exp.timestamp())}:R>' if exp else ''
             msg = f'✅ 已購買 {label}，到期 {ts}'
@@ -2294,6 +2315,7 @@ class ShopFishingEquipView(discord.ui.View):
         await interaction.response.edit_message(
             embed=F._main_embed(interaction.user), view=view,
         )
+        self.stop()
 
     async def _back(self, interaction: discord.Interaction) -> None:
         if not await self._check(interaction):
@@ -2304,6 +2326,7 @@ class ShopFishingEquipView(discord.ui.View):
             await interaction.response.edit_message(
                 embed=F._main_embed(interaction.user), view=view,
             )
+            self.stop()
         else:
             await _render_main_via_edit(interaction, self.root_interaction)
 
@@ -2380,6 +2403,7 @@ class SellMainView(discord.ui.View):
             await interaction.response.edit_message(
                 embed=view.build_embed(interaction.user), view=view,
             )
+            self.stop()
         return _cb
 
     async def _back(self, interaction: discord.Interaction) -> None:
@@ -2407,6 +2431,7 @@ class _SellSubViewBase(discord.ui.View):
         await interaction.response.edit_message(
             embed=view.build_embed(interaction.user), view=view,
         )
+        self.stop()
 
 
 class SellRodsView(_SellSubViewBase):
@@ -2463,6 +2488,7 @@ class SellRodsView(_SellSubViewBase):
         await interaction.response.edit_message(
             embed=new.build_embed(interaction.user), view=new,
         )
+        self.stop()
         msg = f'✅ 已賣出 **{F.ROD_SPECS[rod_key]["name"]}**，獲得 `{gain:,}` 碎片' if ok else f'❌ {err}'
         try:
             await interaction.followup.send(msg, ephemeral=True)
@@ -2535,12 +2561,15 @@ class SellFishView(_SellSubViewBase):
         super().__init__(uid, root_interaction)
         self.page = page
         from commands import fishing as F
+
+        def _sort_key(kv):
+            fk, _, _ = F._split_stored_key(kv[0])
+            return (list(F.RARITIES).index(F.FISH_SPECS[fk]['rarity']), kv[0])
+
         self._owned = sorted(
-            ((k, int(v)) for k, v in F.get_fish(self.uid).items() if int(v) > 0),
-            key=lambda kv: (
-                list(F.RARITIES).index(F.FISH_SPECS[kv[0]]['rarity']),
-                kv[0],
-            ),
+            ((k, int(v)) for k, v in F.get_fish(self.uid).items()
+             if int(v) > 0 and F._split_stored_key(k)[0] in F.FISH_SPECS),
+            key=_sort_key,
         )
         self._page_size = 20
         self.total_pages = max(1, (len(self._owned) + self._page_size - 1) // self._page_size)
@@ -2555,10 +2584,13 @@ class SellFishView(_SellSubViewBase):
             slice_ = self._owned[start:start + self._page_size]
             lines = []
             for k, n in slice_:
-                spec = F.FISH_SPECS[k]
+                fk, tag, wc = F._split_stored_key(k)
+                spec = F.FISH_SPECS[fk]
+                disp = F.display_fish_name(fk, tag, wc)
+                unit = F.get_tagged_price(fk, tag, wc)
                 lines.append(
-                    f'{F.RARITY_EMOJI[spec["rarity"]]} **{spec["name"]}** × {n} '
-                    f'(${spec["price"]:,}/條)'
+                    f'{F.RARITY_EMOJI[spec["rarity"]]} **{disp}** × {n} '
+                    f'(${unit:,}/條)'
                 )
             desc = '\n'.join(lines)
         return discord.Embed(
@@ -2573,10 +2605,13 @@ class SellFishView(_SellSubViewBase):
         slice_ = self._owned[start:start + self._page_size]
         options: list[discord.SelectOption] = []
         for k, n in slice_:
-            spec = F.FISH_SPECS[k]
+            fk, tag, wc = F._split_stored_key(k)
+            spec = F.FISH_SPECS[fk]
+            disp = F.display_fish_name(fk, tag, wc)
+            unit = F.get_tagged_price(fk, tag, wc)
             options.append(discord.SelectOption(
-                label=f'{spec["name"]} × {n}',
-                description=f'{F.RARITY_LABEL[spec["rarity"]]} | ${spec["price"]:,}/條',
+                label=f'{disp} × {n}'[:100],
+                description=f'{F.RARITY_LABEL[spec["rarity"]]} | ${unit:,}/條',
                 value=k,
             ))
         if options:
@@ -2647,6 +2682,7 @@ class SellFishView(_SellSubViewBase):
             await interaction.response.edit_message(
                 embed=new.build_embed(interaction.user), view=new,
             )
+            self.stop()
             try:
                 if count > 0:
                     await interaction.followup.send(
@@ -2668,6 +2704,7 @@ class SellFishView(_SellSubViewBase):
         await interaction.response.edit_message(
             embed=view.build_embed(interaction.user), view=view,
         )
+        self.stop()
 
     async def _sell_all(self, interaction: discord.Interaction) -> None:
         if not await self._check(interaction):
@@ -2678,6 +2715,7 @@ class SellFishView(_SellSubViewBase):
         await interaction.response.edit_message(
             embed=new.build_embed(interaction.user), view=new,
         )
+        self.stop()
         try:
             await interaction.followup.send(
                 f'✅ 清空保溫箱：賣出 **{count}** 條，獲得 `{total:,}` 碎片', ephemeral=True,
@@ -2693,6 +2731,7 @@ class SellFishView(_SellSubViewBase):
         await interaction.response.edit_message(
             embed=new.build_embed(interaction.user), view=new,
         )
+        self.stop()
 
     async def _next(self, interaction: discord.Interaction) -> None:
         if not await self._check(interaction):
@@ -2702,6 +2741,7 @@ class SellFishView(_SellSubViewBase):
         await interaction.response.edit_message(
             embed=new.build_embed(interaction.user), view=new,
         )
+        self.stop()
 
 
 class SellFishCustomView(_SellSubViewBase):
@@ -2711,12 +2751,15 @@ class SellFishCustomView(_SellSubViewBase):
                  selected: list[str] | None = None):
         super().__init__(uid, root_interaction)
         from commands import fishing as F
+
+        def _sort_key(kv):
+            fk, _, _ = F._split_stored_key(kv[0])
+            return (list(F.RARITIES).index(F.FISH_SPECS[fk]['rarity']), kv[0])
+
         self._owned: list[tuple[str, int]] = sorted(
-            ((k, int(v)) for k, v in F.get_fish(self.uid).items() if int(v) > 0),
-            key=lambda kv: (
-                list(F.RARITIES).index(F.FISH_SPECS[kv[0]]['rarity']),
-                kv[0],
-            ),
+            ((k, int(v)) for k, v in F.get_fish(self.uid).items()
+             if int(v) > 0 and F._split_stored_key(k)[0] in F.FISH_SPECS),
+            key=_sort_key,
         )
         valid_keys = {k for k, _ in self._owned}
         self.selected_keys: list[str] = [k for k in (selected or []) if k in valid_keys]
@@ -2731,19 +2774,23 @@ class SellFishCustomView(_SellSubViewBase):
             owned_map = dict(self._owned)
             lines: list[str] = ['**🎯 自訂多選賣魚** — 勾選的種類會把擁有的數量全部賣掉', '']
             for k, n in self._owned[:25]:
-                spec = F.FISH_SPECS[k]
+                fk, tag, wc = F._split_stored_key(k)
+                spec = F.FISH_SPECS[fk]
+                disp = F.display_fish_name(fk, tag, wc)
+                unit = F.get_tagged_price(fk, tag, wc)
                 mark = '☑️' if k in self.selected_keys else '⬜'
                 lines.append(
                     f'{mark} {F.RARITY_EMOJI[spec["rarity"]]} '
-                    f'**{spec["name"]}** × {n} (`${spec["price"]:,}/條`)'
+                    f'**{disp}** × {n} (`${unit:,}/條`)'
                 )
             if len(self._owned) > 25:
                 lines.append(f'_…還有 {len(self._owned) - 25} 種未顯示（Discord 限制最多 25 個選項）_')
             desc = '\n'.join(lines)
-            preview = sum(
-                int(F.FISH_SPECS[k]['price']) * int(owned_map.get(k, 0))
-                for k in self.selected_keys
-            )
+
+            def _preview_one(k):
+                fk, tag, wc = F._split_stored_key(k)
+                return F.get_tagged_price(fk, tag, wc) * int(owned_map.get(k, 0))
+            preview = sum(_preview_one(k) for k in self.selected_keys)
         return discord.Embed(
             title='🛒 販售 — 保溫箱（自訂多選）',
             description=desc + (
@@ -2758,10 +2805,13 @@ class SellFishCustomView(_SellSubViewBase):
         from commands import fishing as F
         options: list[discord.SelectOption] = []
         for k, n in self._owned[:25]:
-            spec = F.FISH_SPECS[k]
+            fk, tag, wc = F._split_stored_key(k)
+            spec = F.FISH_SPECS[fk]
+            disp = F.display_fish_name(fk, tag, wc)
+            unit = F.get_tagged_price(fk, tag, wc)
             options.append(discord.SelectOption(
-                label=f'{spec["name"]} × {n}',
-                description=f'{F.RARITY_LABEL[spec["rarity"]]} | ${spec["price"]:,}/條',
+                label=f'{disp} × {n}'[:100],
+                description=f'{F.RARITY_LABEL[spec["rarity"]]} | ${unit:,}/條',
                 value=k,
                 default=(k in self.selected_keys),
             ))
@@ -2803,6 +2853,7 @@ class SellFishCustomView(_SellSubViewBase):
         await interaction.response.edit_message(
             embed=new.build_embed(interaction.user), view=new,
         )
+        self.stop()
 
     async def _on_confirm(self, interaction: discord.Interaction) -> None:
         if not await self._check(interaction):
@@ -2825,6 +2876,7 @@ class SellFishCustomView(_SellSubViewBase):
         await interaction.response.edit_message(
             embed=new.build_embed(interaction.user), view=new,
         )
+        self.stop()
         try:
             await interaction.followup.send(
                 f'✅ 自訂賣出 **{len(self.selected_keys)}** 種共 '
@@ -2841,6 +2893,7 @@ class SellFishCustomView(_SellSubViewBase):
         await interaction.response.edit_message(
             embed=new.build_embed(interaction.user), view=new,
         )
+        self.stop()
 
 
 class SellMiscView(_SellSubViewBase):
@@ -2906,6 +2959,7 @@ class SellMiscView(_SellSubViewBase):
             await interaction.response.edit_message(
                 embed=new.build_embed(interaction.user), view=new,
             )
+            self.stop()
             msg = f'✅ 已賣出 {name} × {n}，獲得 `{gain:,}` 碎片' if ok else f'❌ {err}'
             try:
                 await interaction.followup.send(msg, ephemeral=True)
@@ -2945,7 +2999,8 @@ class _SellQtyModal(discord.ui.Modal, title='販售數量'):
             name = F.BAIT_SPECS[self.key]['name']
         elif self.mode == 'fish':
             ok, err, gain = await F.sell_fish_from_pond(self.uid, self.key, qty)
-            name = F.FISH_SPECS[self.key]['name']
+            fk, tag, wc = F._split_stored_key(self.key)
+            name = F.display_fish_name(fk, tag, wc)
         else:
             await interaction.response.send_message('未知販售類型', ephemeral=True)
             return
@@ -3489,6 +3544,7 @@ class ShopMainView(discord.ui.View):
                 await interaction.response.send_message('此商品需在伺服器內使用', ephemeral=True)
                 return
             await interaction.response.edit_message(embed=embed, view=view)
+            self.stop()
         return _cb
 
     async def _goto_bank_cb(self, interaction: discord.Interaction) -> None:
@@ -3546,6 +3602,7 @@ class ShopMainView(discord.ui.View):
         try:
             await interaction.response.defer()
             await self.root_interaction.delete_original_response()
+            self.stop()
         except discord.HTTPException:
             pass
 
@@ -3566,6 +3623,7 @@ async def _render_main_via_edit(interaction: discord.Interaction,
     if not interaction.response.is_done():
         try:
             await interaction.response.edit_message(embed=embed, view=view)
+            self.stop()
             return
         except discord.HTTPException:
             pass

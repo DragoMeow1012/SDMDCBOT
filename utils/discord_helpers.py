@@ -218,7 +218,7 @@ class LeaderboardView(discord.ui.View):
     def __init__(self, guild: discord.Guild, records: dict[str, int],
                  title: str, unit: str = '次',
                  color: discord.Color | None = None):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.guild   = guild
         self.entries = sorted(records.items(), key=lambda x: x[1], reverse=True)
         self.title   = title

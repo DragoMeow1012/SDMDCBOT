@@ -94,7 +94,7 @@ class _GagConfirmView(discord.ui.View):
 
 class _RouletteView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=60)
+        super().__init__(timeout=86400)
         self.participants: list[discord.Member] = []
         self.closed = False
 
@@ -229,7 +229,7 @@ _FISHING_PHRASES = [
 
 class _FishingView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
 
     @discord.ui.button(label='咬鉤', style=discord.ButtonStyle.danger)
     async def bite(self, interaction: discord.Interaction, _btn: discord.ui.Button):

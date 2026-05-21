@@ -10,6 +10,7 @@ UI helper：send_smart() 自動依 interaction 狀態挑 response.send_message
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -27,6 +28,11 @@ _DEFAULT_REC = {
     'last_day':   None,
 }
 
+# 全域 read-modify-write lock：morning_records.json 的所有寫入路徑都必須持有這把鎖
+# 才能 load + 修改 + save。避免 coroutine A load → B load → A save → B save 互相覆蓋。
+# shop.py / morning.py / stock.py / daily_task.py / _wallet.py 內部都統一用這把鎖。
+WALLET_LOCK = asyncio.Lock()
+
 
 def get_balance(uid: str) -> int:
     return int(load_json(_FILE).get('users', {}).get(uid, {}).get('balance', 0))
@@ -34,12 +40,13 @@ def get_balance(uid: str) -> int:
 
 async def apply_delta(uid: str, delta: int) -> int:
     """單一原子操作：balance += delta，回傳新餘額。delta 可正可負。"""
-    data  = load_json(_FILE)
-    users = data.setdefault('users', {})
-    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
-    rec['balance'] = int(rec.get('balance', 0)) + delta
-    await save_json_async(_FILE, data)
-    return int(rec['balance'])
+    async with WALLET_LOCK:
+        data  = load_json(_FILE)
+        users = data.setdefault('users', {})
+        rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+        rec['balance'] = int(rec.get('balance', 0)) + delta
+        await save_json_async(_FILE, data)
+        return int(rec['balance'])
 
 
 async def settle_bet(uid: str, cost: int, payout: int) -> int:
@@ -72,24 +79,25 @@ async def settle_with_streak(
     won  = payout > bet
     lost = payout < bet
 
-    data  = load_json(_FILE)
-    users = data.setdefault('users', {})
-    rec   = users.setdefault(uid, dict(_DEFAULT_REC))
+    async with WALLET_LOCK:
+        data  = load_json(_FILE)
+        users = data.setdefault('users', {})
+        rec   = users.setdefault(uid, dict(_DEFAULT_REC))
 
-    streak = int(rec.get('gamble_streak', 0))
-    bonus  = 0
-    if won:
-        streak += 1
-        pct = min(STREAK_BONUS_PER_STEP * (streak - 1), STREAK_BONUS_CAP)
-        bonus = int((payout - bet) * pct)
-    elif lost:
-        streak = 0
+        streak = int(rec.get('gamble_streak', 0))
+        bonus  = 0
+        if won:
+            streak += 1
+            pct = min(STREAK_BONUS_PER_STEP * (streak - 1), STREAK_BONUS_CAP)
+            bonus = int((payout - bet) * pct)
+        elif lost:
+            streak = 0
 
-    delta = (payout if deducted else (payout - bet)) + bonus
-    rec['balance']       = int(rec.get('balance', 0)) + delta
-    rec['gamble_streak'] = streak
-    await save_json_async(_FILE, data)
-    return int(rec['balance']), streak, bonus
+        delta = (payout if deducted else (payout - bet)) + bonus
+        rec['balance']       = int(rec.get('balance', 0)) + delta
+        rec['gamble_streak'] = streak
+        await save_json_async(_FILE, data)
+        return int(rec['balance']), streak, bonus
 
 
 def streak_line(streak: int, bonus: int) -> str | None:

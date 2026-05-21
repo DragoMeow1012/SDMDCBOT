@@ -150,7 +150,7 @@ class EndOfGameView(discord.ui.View):
 
     def __init__(self, uid: str, bet: int, options: dict[str, Any],
                  run_round: RoundFn, start_setup: StartFn):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.uid          = uid
         self.bet          = bet
         self.options      = options

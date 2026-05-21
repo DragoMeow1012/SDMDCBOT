@@ -97,7 +97,7 @@ def _need_target(用戶: discord.Member | None) -> str | None:
 class _RelationView(discord.ui.View):
     def __init__(self, requester: discord.Member, target: discord.Member,
                  guild_id: int, mode: str):
-        super().__init__(timeout=60)
+        super().__init__(timeout=86400)
         self.requester = requester
         self.target    = target
         self.guild_id  = guild_id

@@ -293,9 +293,14 @@ def _other_active_potion(uid: str, self_kind: str) -> str | None:
 
 
 async def buy_luck_potion(uid: str, kind: str) -> tuple[bool, str, datetime | None]:
-    """kind = 'i' / 'ii' / 'iii'。買新覆蓋舊：任何既有藥水都會被清空，新藥水
-    從 now+POTION_DURATION_MIN 起算。三種藥水彼此互不共存（買哪個就只剩哪個）。
-    祝福屬獨立系統，不受影響。"""
+    """kind = 'i' / 'ii' / 'iii'。
+
+    規則：
+      - 沒有任何藥水：寫入 now + 30min
+      - 同種藥水生效中：時長 +30min，cap 3h（超過 → 拒絕購買並退錢）
+      - 不同種藥水生效中：清空其他兩種，新藥水從 now + 30min 重新起算
+      - 祝福屬獨立系統，不受影響
+    """
     if kind not in ('i', 'ii', 'iii'):
         return False, '未知藥水', None
     field = _POTION_FIELDS[kind][0]
@@ -308,15 +313,35 @@ async def buy_luck_potion(uid: str, kind: str) -> tuple[bool, str, datetime | No
         return False, f'餘額不足，需要 {price:,}（你有 {cur_balance:,}）', None
 
     now = datetime.now()
-    new_exp = now + timedelta(minutes=POTION_DURATION_MIN)
+    cur_self = _get_active_buff_until(uid, field)
+    has_other = any(
+        _get_active_buff_until(uid, _POTION_FIELDS[k][0])
+        for k in _POTION_FIELDS if k != kind
+    )
+
+    if has_other:
+        # 買別種 → 替換：清掉其他兩種，自己從 now + 30min 起算
+        new_exp = now + timedelta(minutes=POTION_DURATION_MIN)
+    elif cur_self is not None:
+        # 同種累加，cap 3h
+        new_exp = cur_self + timedelta(minutes=POTION_DURATION_MIN)
+        cap = now + timedelta(minutes=POTION_STACK_CAP_MIN)
+        if new_exp > cap:
+            return (False,
+                    f'❌ {_POTION_FIELDS[kind][1]} 已達累計上限 '
+                    f'{POTION_STACK_CAP_MIN // 60} 小時',
+                    cur_self)
+    else:
+        new_exp = now + timedelta(minutes=POTION_DURATION_MIN)
 
     await apply_delta(uid, -price)
     async with _FILE_LOCK:
         data = _load_all()
         rec = _get_or_init_rec(data, uid)
-        # 買新覆蓋舊：先清空全部三種藥水，再把目標寫入
+        # 買別種時清掉其他兩種；同種累加只動自己；空狀態只寫自己
         for f, _ in _POTION_FIELDS.values():
-            rec[f] = None
+            if f != field:
+                rec[f] = None
         rec[field] = new_exp.isoformat()
         save_json(_FILE, data)
     return True, '', new_exp
@@ -1411,7 +1436,7 @@ def _main_embed(user: discord.abc.User, *, message: str | None = None) -> discor
 class FishingMainView(discord.ui.View):
     def __init__(self, uid: str, root_interaction: discord.Interaction,
                  *, message: str | None = None):
-        super().__init__(timeout=600)
+        super().__init__(timeout=86400)
         self.uid = uid
         self.root_interaction = root_interaction
         self.message_hint = message
@@ -1559,16 +1584,20 @@ class FishingMainView(discord.ui.View):
 
     async def _redraw(self, interaction: discord.Interaction,
                        *, message: str | None = None) -> None:
-        new_view = FishingMainView(self.uid, self.root_interaction, message=message)
+        # 就地重建：同一個 view 物件 clear_items + 重新 _build，避免每次 spawn 新 view 累積
+        # discord.py 內部 message↔view 綁定 + timeout task，防長期使用後的按鈕渲染錯誤
+        self.message_hint = message
+        self.clear_items()
+        self._build()
         embed = _main_embed(interaction.user, message=message)
         if not interaction.response.is_done():
             try:
-                await interaction.response.edit_message(embed=embed, view=new_view)
+                await interaction.response.edit_message(embed=embed, view=self)
                 return
             except discord.HTTPException:
                 pass
         try:
-            await self.root_interaction.edit_original_response(embed=embed, view=new_view)
+            await self.root_interaction.edit_original_response(embed=embed, view=self)
         except discord.HTTPException:
             pass
 
@@ -1683,6 +1712,7 @@ class FishingMainView(discord.ui.View):
 
         # 關閉 ephemeral 主面板（已開始釣，無須再顯示）
         # 用 interaction.delete_original_response() 比 root_interaction 穩定
+        self.stop()
         # —— button click 的 original 就是這條 ephemeral message
         try:
             await interaction.response.defer()
@@ -1691,6 +1721,7 @@ class FishingMainView(discord.ui.View):
         for target in (interaction, self.root_interaction):
             try:
                 await target.delete_original_response()
+                self.stop()
                 break
             except discord.HTTPException:
                 continue
@@ -1707,6 +1738,7 @@ class FishingMainView(discord.ui.View):
             return
         view = DexView(self.uid, self.root_interaction, page=0)
         await interaction.response.edit_message(embed=view.build_embed(interaction.user), view=view)
+        self.stop()   # 切到不同類 view → 釋放本 view 的 timer
 
     async def _on_view_pond(self, interaction: discord.Interaction) -> None:
         """主面板上看保溫箱 — 直接 edit 同個 ephemeral 切到 PondInventoryView。
@@ -1718,6 +1750,7 @@ class FishingMainView(discord.ui.View):
         await interaction.response.edit_message(
             embed=view.build_embed(interaction.user), view=view,
         )
+        self.stop()
 
     async def _on_buy_equip(self, interaction: discord.Interaction) -> None:
         """打開「釣魚用品」面板（與商店同步），返回鈕回到本主面板。"""
@@ -1729,6 +1762,7 @@ class FishingMainView(discord.ui.View):
         await interaction.response.edit_message(
             embed=view.build_embed(interaction.user), view=view,
         )
+        self.stop()
 
     async def _on_feed_meow(self, interaction: discord.Interaction) -> None:
         """打開投餵小龍喵選單。"""
@@ -1738,6 +1772,7 @@ class FishingMainView(discord.ui.View):
         await interaction.response.edit_message(
             embed=view.build_embed(interaction.user), view=view,
         )
+        self.stop()
 
     async def _on_goto_shop(self, interaction: discord.Interaction) -> None:
         if not await self._check_owner(interaction):
@@ -1749,6 +1784,7 @@ class FishingMainView(discord.ui.View):
         await interaction.response.edit_message(
             embed=_main_shop_embed(interaction.user), view=view,
         )
+        self.stop()
 
     async def _on_force_reset(self, interaction: discord.Interaction) -> None:
         """緊急收竿：清掉 active_session、退魚餌、重抓魚塘狀態。
@@ -1776,6 +1812,7 @@ class FishingMainView(discord.ui.View):
         await interaction.response.edit_message(
             embed=_main_embed(interaction.user), view=new_view,
         )
+        self.stop()
         parts: list[str] = []
         if refunded:
             parts.append(f'退回 {refunded} 個魚餌')
@@ -1801,10 +1838,12 @@ class FishingMainView(discord.ui.View):
             return
         view = WhitelistView(self.uid, self.root_interaction)
         await interaction.response.edit_message(embed=view.build_embed(interaction.user), view=view)
+        self.stop()
 
     async def _on_close(self, interaction: discord.Interaction) -> None:
         if not await self._check_owner(interaction):
             return
+        self.stop()
         try:
             await interaction.response.defer()
         except discord.HTTPException:
@@ -1812,9 +1851,66 @@ class FishingMainView(discord.ui.View):
         for target in (interaction, self.root_interaction):
             try:
                 await target.delete_original_response()
+                self.stop()
                 return
             except discord.HTTPException:
                 continue
+
+
+# ── 進行中 view 的標題池（每 stage 多種，隨機抽，增加變化）──────────────
+_PROGRESS_TITLES: dict[str, list[str]] = {
+    'cast': [
+        '🎣 等待魚兒上鉤中…',
+        '🎣 浮標靜靜漂著…',
+        '🎣 屏息凝視水面…',
+        '🎣 漣漪輕輕擴散…',
+        '🎣 水波倒映著雲影…',
+        '🌊 水面平靜得像鏡子…',
+        '🎐 風吹過釣場…',
+        '🐚 等待水底的回應…',
+        '🪷 浮標伴著落葉漂…',
+        '🍃 釣絲微微繃緊…',
+        '☁️ 沈靜的午後釣場…',
+        '🎣 水底似乎有些動靜…',
+        '🐌 時間慢了下來…',
+        '🎣 釣線靜靜垂下…',
+        '🪱 餌料散發著香氣…',
+    ],
+    'tick_gentle': [
+        '🐟 魚標微微抖動…',
+        '🐟 魚標輕輕點了一下…',
+        '🐟 水下傳來細微觸感…',
+        '🐟 浮標似乎在試探…',
+        '🐠 水紋出現規律的擾動…',
+        '🐟 有東西正在啃食 ⌒',
+        '🌀 浮標畫出小小的圓…',
+        '🐟 魚線傳來若有若無的震動…',
+        '🪶 像羽毛輕拂的觸感…',
+        '🐟 魚兒正在打量魚餌…',
+        '💧 水面起了小小漣漪…',
+        '🐟 浮標微微下沉一寸…',
+        '🐠 魚線繃了一下又鬆…',
+        '🐟 魚標往側邊輕拖…',
+        '🌊 水底氣泡冒出來了…',
+    ],
+    'tick_strong': [
+        '🌊 魚標劇烈晃動！！',
+        '💥 浮標被狠狠拽下去！！',
+        '🐉 魚線繃成一條直線！！',
+        '🌊 水花四濺！！',
+        '🌪️ 整支竿都在抖！！',
+        '⚡ 釣絲尖叫出聲！！',
+        '🚨 水下傳來巨大拉力！！',
+        '🌊 浮標完全沉沒！！',
+        '💢 是條大傢伙！！',
+        '🔥 釣竿彎成弓型！！',
+        '🌊 水面被劇烈推開！！',
+        '⚡ 魚線快要承受不住！！',
+        '🐲 像有東西要把竿子拖下水！！',
+        '🌊 釣場掀起白浪！！',
+        '💥 收緊魚線的最後一刻！！',
+    ],
+}
 
 
 # ── 釣魚進行中 view + embed ─────────────────────────────────────────────
@@ -1831,18 +1927,18 @@ def _progress_embed(user: discord.abc.User, rod_key: str, bait_key: str,
     rod = ROD_SPECS[rod_key]
     bait = BAIT_SPECS[bait_key]
     if stage == 'cast':
-        title = '🎣 等待魚兒上鉤中…'
+        title = random.choice(_PROGRESS_TITLES['cast'])
         head = (
             f'**{user.display_name}** 用 **{rod["name"]}** 掛上 **{bait["name"]}**，'
             f'魚線沉入水中。'
         )
         color = discord.Color.blue()
     elif stage == 'tick_gentle':
-        title = '🐟 魚標微微抖動…'
+        title = random.choice(_PROGRESS_TITLES['tick_gentle'])
         head = f'**{user.display_name}** 的魚線傳來細微的觸感，水面下似乎有什麼正在靠近魚餌。'
         color = discord.Color.teal()
     elif stage == 'tick_strong':
-        title = '🌊 魚標劇烈晃動！！'
+        title = random.choice(_PROGRESS_TITLES['tick_strong'])
         head = f'**{user.display_name}** 的魚線猛烈拉動，水花四濺！一定是條大傢伙！'
         color = discord.Color.orange()
     else:
@@ -1946,7 +2042,20 @@ async def _run_fishing_task(*, uid: str, public_msg: discord.Message,
             pass
 
     except Exception as e:
-        print(f'[FISHING] task error uid={uid}: {e}')
+        print(f'[FISHING] task error uid={uid}: {type(e).__name__}: {e}')
+        # 任何例外都要清掉 session，避免玩家被卡在「進行中」狀態（按鈕全暗）
+        try:
+            await _clear_session(uid)
+        except Exception as e2:
+            print(f'[FISHING] _clear_session 失敗 uid={uid}: {e2}')
+        # 公開訊息補一行錯誤提示，讓玩家知道可以再開 /fishing
+        try:
+            await public_msg.edit(
+                content=f'⚠️ {fisher.mention} 釣魚過程出錯，本次餌已扣（請重開 /fishing 繼續）',
+                embed=None, view=None,
+            )
+        except discord.HTTPException:
+            pass
 
 
 # ── 上鉤頁 embed + view ─────────────────────────────────────────────────
@@ -2056,6 +2165,7 @@ class HookedView(discord.ui.View):
                     embed=embed, view=view,
                     allowed_mentions=discord.AllowedMentions(users=True),
                 )
+                self.stop()
             except discord.HTTPException:
                 pass
             return
@@ -2073,6 +2183,7 @@ class HookedView(discord.ui.View):
                 embed=embed, view=view,
                 allowed_mentions=discord.AllowedMentions(users=True),
             )
+            self.stop()
         except discord.HTTPException:
             pass
 
@@ -2167,8 +2278,9 @@ class FishingEscapedView(discord.ui.View):
         """再試一次：同竿同餌再起一場（共用 FishingResultView._on_recast 的邏輯）。"""
         if not await self._check_owner(interaction):
             return
-        self.stop()
-        # 借 FishingResultView 的 recast 路徑（傳一個臨時 view 進去呼叫）
+        # 不要在這裡就 self.stop()：若 proxy._on_recast 因魚餌用盡 / 白名單 / 倉滿
+        # 而 early return，舊 view 還要保留讓玩家能按「返回設定」/「關閉」。
+        # 成功進入新場次時，proxy._on_recast 內的 edit_message 會自動換 view。
         proxy = FishingResultView(
             self.uid, self.public_msg, fisher=self.fisher,
             last_rod=self.last_rod, last_bait=self.last_bait,
@@ -2303,7 +2415,7 @@ class FishingResultView(discord.ui.View):
                  sold: int | None = None, kept: bool = False,
                  auto_sold: int | None = None,
                  story_s3: str = ''):
-        super().__init__(timeout=600)
+        super().__init__(timeout=86400)
         self.uid = uid
         self.public_msg = public_msg
         self.fisher = fisher
@@ -2415,6 +2527,7 @@ class FishingResultView(discord.ui.View):
         embed = _post_resolve_embed(self.fisher, sold=paid,
                                     story_line=self.story_s3)
         await interaction.response.edit_message(embed=embed, view=new_view)
+        self.stop()
 
     async def _on_keep(self, interaction: discord.Interaction) -> None:
         if not await self._check_owner(interaction):
@@ -2455,11 +2568,15 @@ class FishingResultView(discord.ui.View):
                                     fish_name=(display_fish_name(fk, tag_before) if fk else ''),
                                     story_line=self.story_s3)
         await interaction.response.edit_message(embed=embed, view=new_view)
+        self.stop()
 
     async def _on_recast(self, interaction: discord.Interaction) -> None:
         if not await self._check_owner(interaction):
             return
-        self.stop()   # 切換 view 後不需要 timeout 再 fire
+        # 不要在這裡就 self.stop()，否則所有 early return（魚餌用盡 / 白名單 / 倉滿）
+        # 都會把舊 view 殺掉，玩家看到的訊息變成不能互動。
+        # 改在實際成功 edit_message 後（line 2642）才 stop。
+
         # 結束前若有未處理的 pending → 自動保留
         sess = get_active_session(self.uid)
         if sess and sess.get('pending_catch') and self.sold is None and not self.kept:
@@ -2526,6 +2643,7 @@ class FishingResultView(discord.ui.View):
                 embed=embed, view=progress_view,
                 allowed_mentions=discord.AllowedMentions(users=False),
             )
+            self.stop()
         except discord.HTTPException as e:
             await adjust_bait(self.uid, bait_key, +1)
             await _clear_session(self.uid)
@@ -2904,6 +3022,7 @@ class DexView(discord.ui.View):
         await interaction.response.edit_message(
             embed=new.build_embed(interaction.user), view=new,
         )
+        self.stop()
 
     async def _jump_page(self, interaction: discord.Interaction) -> None:
         if not await self._check_owner(interaction):
@@ -2917,6 +3036,7 @@ class DexView(discord.ui.View):
         await interaction.response.edit_message(
             embed=new.build_embed(interaction.user), view=new,
         )
+        self.stop()
 
     async def _prev(self, interaction: discord.Interaction) -> None:
         if not await self._check_owner(interaction):
@@ -2925,6 +3045,7 @@ class DexView(discord.ui.View):
         new = DexView(self.uid, self.root_interaction, page=self.page,
                       close_on_back=self.close_on_back)
         await interaction.response.edit_message(embed=new.build_embed(interaction.user), view=new)
+        self.stop()
 
     async def _next(self, interaction: discord.Interaction) -> None:
         if not await self._check_owner(interaction):
@@ -2933,6 +3054,7 @@ class DexView(discord.ui.View):
         new = DexView(self.uid, self.root_interaction, page=self.page,
                       close_on_back=self.close_on_back)
         await interaction.response.edit_message(embed=new.build_embed(interaction.user), view=new)
+        self.stop()
 
     async def _back(self, interaction: discord.Interaction) -> None:
         if not await self._check_owner(interaction):
@@ -2941,6 +3063,7 @@ class DexView(discord.ui.View):
             try:
                 await interaction.response.defer()
                 await interaction.delete_original_response()
+                self.stop()
             except discord.HTTPException:
                 pass
             return
@@ -2948,6 +3071,7 @@ class DexView(discord.ui.View):
         await interaction.response.edit_message(
             embed=_main_embed(interaction.user), view=main,
         )
+        self.stop()
 
 
 # ── 保溫箱庫存（從釣魚結算頁開啟，可順手賣）─────────────────────────────
@@ -3108,6 +3232,7 @@ class PondInventoryView(discord.ui.View):
         await interaction.response.edit_message(
             embed=new.build_embed(interaction.user), view=new,
         )
+        self.stop()
 
     async def _on_pick(self, interaction: discord.Interaction) -> None:
         if not await self._check(interaction):
@@ -3156,6 +3281,7 @@ class PondInventoryView(discord.ui.View):
         await interaction.response.edit_message(
             embed=new.build_embed(interaction.user), view=new,
         )
+        self.stop()
 
     async def _next(self, interaction: discord.Interaction) -> None:
         if not await self._check(interaction):
@@ -3166,6 +3292,7 @@ class PondInventoryView(discord.ui.View):
         await interaction.response.edit_message(
             embed=new.build_embed(interaction.user), view=new,
         )
+        self.stop()
 
     async def _close(self, interaction: discord.Interaction) -> None:
         if not await self._check(interaction):
@@ -3176,11 +3303,13 @@ class PondInventoryView(discord.ui.View):
             await interaction.response.edit_message(
                 embed=_main_embed(interaction.user), view=main,
             )
+            self.stop()
         else:
             # 從結算頁進來 → 關掉 ephemeral，公開結算頁仍可見
             try:
                 await interaction.response.defer()
                 await interaction.delete_original_response()
+                self.stop()
             except discord.HTTPException:
                 pass
 
@@ -3391,6 +3520,7 @@ class FeedMeowView(discord.ui.View):
         await interaction.response.edit_message(
             embed=new.build_embed(interaction.user), view=new,
         )
+        self.stop()
         try:
             await interaction.followup.send(msg, ephemeral=True)
         except discord.HTTPException:
@@ -3404,6 +3534,7 @@ class FeedMeowView(discord.ui.View):
         await interaction.response.edit_message(
             embed=new.build_embed(interaction.user), view=new,
         )
+        self.stop()
 
     async def _next(self, interaction: discord.Interaction) -> None:
         if not await self._check(interaction):
@@ -3413,6 +3544,7 @@ class FeedMeowView(discord.ui.View):
         await interaction.response.edit_message(
             embed=new.build_embed(interaction.user), view=new,
         )
+        self.stop()
 
     async def _back(self, interaction: discord.Interaction) -> None:
         if not await self._check(interaction):
@@ -3421,6 +3553,7 @@ class FeedMeowView(discord.ui.View):
         await interaction.response.edit_message(
             embed=_main_embed(interaction.user), view=main,
         )
+        self.stop()
 
 
 # ── 釣竿購買子面板 ──────────────────────────────────────────────────────
@@ -3511,6 +3644,7 @@ class RodShopView(discord.ui.View):
                           back_to_shop_equip=self.back_to_shop_equip,
                           back_to_fishing_main=self.back_to_fishing_main)
         await interaction.response.edit_message(embed=new.build_embed(interaction.user), view=new)
+        self.stop()
         try:
             await interaction.followup.send(msg, ephemeral=True)
         except discord.HTTPException:
@@ -3528,11 +3662,13 @@ class RodShopView(discord.ui.View):
             await interaction.response.edit_message(
                 embed=view.build_embed(interaction.user), view=view,
             )
+            self.stop()
         else:
             await interaction.response.edit_message(
                 embed=_main_embed(interaction.user),
                 view=FishingMainView(self.uid, self.root_interaction),
             )
+            self.stop()
 
     async def _go_fishing(self, interaction: discord.Interaction) -> None:
         """無論 entry 是商店或 /fishing，都把面板切到釣魚主面板。"""
@@ -3542,6 +3678,7 @@ class RodShopView(discord.ui.View):
             embed=_main_embed(interaction.user),
             view=FishingMainView(self.uid, self.root_interaction),
         )
+        self.stop()
 
 
 # ── 魚餌購買子面板 ──────────────────────────────────────────────────────
@@ -3643,6 +3780,7 @@ class BaitShopView(discord.ui.View):
             embed=_main_embed(interaction.user),
             view=FishingMainView(self.uid, self.root_interaction),
         )
+        self.stop()
 
     async def _on_pick(self, interaction: discord.Interaction) -> None:
         if not await self._check_owner(interaction):
@@ -3662,6 +3800,7 @@ class BaitShopView(discord.ui.View):
                            back_to_shop_equip=self.back_to_shop_equip,
                            back_to_fishing_main=self.back_to_fishing_main)
         await interaction.response.edit_message(embed=new.build_embed(interaction.user), view=new)
+        self.stop()
 
     async def _next(self, interaction: discord.Interaction) -> None:
         if not await self._check_owner(interaction):
@@ -3671,6 +3810,7 @@ class BaitShopView(discord.ui.View):
                            back_to_shop_equip=self.back_to_shop_equip,
                            back_to_fishing_main=self.back_to_fishing_main)
         await interaction.response.edit_message(embed=new.build_embed(interaction.user), view=new)
+        self.stop()
 
     async def _back(self, interaction: discord.Interaction) -> None:
         if not await self._check_owner(interaction):
@@ -3684,11 +3824,13 @@ class BaitShopView(discord.ui.View):
             await interaction.response.edit_message(
                 embed=view.build_embed(interaction.user), view=view,
             )
+            self.stop()
         else:
             await interaction.response.edit_message(
                 embed=_main_embed(interaction.user),
                 view=FishingMainView(self.uid, self.root_interaction),
             )
+            self.stop()
 
 
 class BaitBuyModal(discord.ui.Modal, title='購買魚餌'):
@@ -3809,6 +3951,7 @@ class WhitelistView(discord.ui.View):
         msg = '✅ 已加入白名單' if ok else '此頻道已在白名單內'
         new = WhitelistView(self.uid, self.root_interaction)
         await interaction.response.edit_message(embed=new.build_embed(interaction.user), view=new)
+        self.stop()
         try:
             await interaction.followup.send(msg, ephemeral=True)
         except discord.HTTPException:
@@ -3822,6 +3965,7 @@ class WhitelistView(discord.ui.View):
         msg = '✅ 已從白名單移除' if ok else '此頻道不在白名單內'
         new = WhitelistView(self.uid, self.root_interaction)
         await interaction.response.edit_message(embed=new.build_embed(interaction.user), view=new)
+        self.stop()
         try:
             await interaction.followup.send(msg, ephemeral=True)
         except discord.HTTPException:
@@ -3832,6 +3976,7 @@ class WhitelistView(discord.ui.View):
             embed=_main_embed(interaction.user),
             view=FishingMainView(self.uid, self.root_interaction),
         )
+        self.stop()
 
 
 # ── 贈禮接收訊息 View（給 shop.py 贈禮流程發訊息用） ────────────────────

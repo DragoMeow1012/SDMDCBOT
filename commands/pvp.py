@@ -232,7 +232,7 @@ class _InstantPVPSession:
 
 class _InstantPVPPublicView(discord.ui.View):
     def __init__(self, session: _InstantPVPSession):
-        super().__init__(timeout=900)
+        super().__init__(timeout=86400)
         self.session = session
         self._build()
 
@@ -395,7 +395,7 @@ class PVPAgainView(discord.ui.View):
 
     def __init__(self, init_user, opp_user, bet: int, game_type: str,
                  extra: dict | None = None):
-        super().__init__(timeout=600)
+        super().__init__(timeout=86400)
         self.init_user  = init_user
         self.opp_user   = opp_user
         self.bet        = bet
@@ -698,7 +698,7 @@ class PVP21PublicView(discord.ui.View):
     """公開訊息上的「我的牌」按鈕（2 顆，各自門禁）。"""
 
     def __init__(self, session: PVP21Session):
-        super().__init__(timeout=900)
+        super().__init__(timeout=86400)
         self.session = session
         self._build()
 
@@ -731,7 +731,7 @@ class PVP21EphView(discord.ui.View):
     """個人 ephemeral 的要牌/停牌按鈕。"""
 
     def __init__(self, session: PVP21Session, owner_id: int):
-        super().__init__(timeout=900)
+        super().__init__(timeout=86400)
         self.session  = session
         self.owner_id = owner_id
         self._build()
@@ -968,7 +968,7 @@ class _PVPCrashSession:
 
 class _PVPCrashPublicView(discord.ui.View):
     def __init__(self, session: _PVPCrashSession):
-        super().__init__(timeout=900)
+        super().__init__(timeout=86400)
         self.session = session
         self._build()
 
@@ -999,7 +999,7 @@ class _PVPCrashPublicView(discord.ui.View):
 
 class _PVPCrashEphView(discord.ui.View):
     def __init__(self, session: _PVPCrashSession, owner_id: int):
-        super().__init__(timeout=900)
+        super().__init__(timeout=86400)
         self.session  = session
         self.owner_id = owner_id
         self._build()
@@ -1271,7 +1271,7 @@ class _PVPMinesSession:
 
 class _PVPMinesPublicView(discord.ui.View):
     def __init__(self, session: _PVPMinesSession):
-        super().__init__(timeout=900)
+        super().__init__(timeout=86400)
         self.session = session
         self._build()
 
@@ -1304,7 +1304,7 @@ class _PVPMinesEphView(discord.ui.View):
     """私訊：5×4 = 20 個格子（row 0~3）+ 第 5 列 1 顆 💰 提現。"""
 
     def __init__(self, session: _PVPMinesSession, owner_id: int):
-        super().__init__(timeout=900)
+        super().__init__(timeout=86400)
         self.session  = session
         self.owner_id = owner_id
         self._build()
@@ -1437,7 +1437,7 @@ class PVPInviteView(discord.ui.View):
 
     def __init__(self, init_user: discord.abc.User,
                  opp_user: discord.abc.User, bet: int):
-        super().__init__(timeout=600)  # 10 分鐘給對手反應
+        super().__init__(timeout=86400)  # 10 分鐘給對手反應
         self.init_user = init_user
         self.opp_user  = opp_user
         self.bet       = bet

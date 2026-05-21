@@ -22,7 +22,7 @@ def _resolve_mentions(text: str, mentions: list) -> str:
 
 class QuoteToggleView(discord.ui.View):
     def __init__(self, avatar_url: str, quote: str, author_name: str, author_id: int, grayscale: bool = True):
-        super().__init__(timeout=120)
+        super().__init__(timeout=86400)
         self.avatar_url  = avatar_url
         self.quote       = quote
         self.author_name = author_name

@@ -814,6 +814,7 @@ class StockSystemView(View):
                 try:
                     await inter.response.defer()
                     await inter.delete_original_response()
+                    self.stop()
                 except discord.HTTPException:
                     pass
             close.callback = _close
@@ -864,6 +865,7 @@ class AccountPagerView(View):
             try:
                 await inter.response.defer()
                 await inter.delete_original_response()
+                self.stop()
             except discord.HTTPException:
                 pass
 
@@ -1559,6 +1561,7 @@ class _MarginCloseSelect(discord.ui.Select):
             ticker=ticker, max_shares=max_shares,
             back_to_shop=self.back_to_shop, refresh_target=self.refresh_target,
         ))
+        self.stop()
 
 
 class MarginCloseSelectView(View):
@@ -1678,7 +1681,7 @@ class _MarginAddSelect(discord.ui.Select):
             color=discord.Color.blue(),
         )
 
-        view = View(timeout=300)
+        view = View(timeout=86400)
         def _make(src: str, label: str, style):
             b = Button(label=label, style=style, row=0)
             async def _cb(inter: discord.Interaction) -> None:
@@ -1704,6 +1707,7 @@ class _MarginAddSelect(discord.ui.Select):
         view.add_item(back)
 
         await interaction.response.edit_message(embed=embed, view=view)
+        self.stop()
 
 
 class MarginAddSelectView(View):
