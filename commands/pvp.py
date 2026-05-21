@@ -1376,7 +1376,7 @@ class _PVPMinesDifficultyView(discord.ui.View):
     """對手選擇地雷數（3/8/15）後才正式開局。"""
 
     def __init__(self, init_user, opp_user, bet: int):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.init_user = init_user
         self.opp_user  = opp_user
         self.bet       = bet
@@ -1641,7 +1641,7 @@ def _setup_embed(user: discord.abc.User, opponent: discord.Member,
 class PVPSetupView(discord.ui.View):
     def __init__(self, uid: str, opponent: discord.Member,
                  bet: int = DEFAULT_BET):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.uid      = uid
         self.opponent = opponent
         self.bet      = bet

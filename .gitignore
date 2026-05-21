@@ -36,9 +36,11 @@ data/bot.log
 
 # ── 本地資料（聊天歷史、暱稱、知識庫、炮決記錄等皆不上傳）──
 # 目錄整體忽略，但保留目錄本身 + picture 固定素材
+# 例外：data/*.py 屬於程式碼/資料定義（魚種、劇本），不是 runtime state，要跟著版控
 data/*
 !data/picture/
 !data/.gitkeep
+!data/*.py
 data/picture/*.tmp
 
 # ── Pixiv 爬蟲資料（圖片 + SQLite + FAISS，體積大且為本地快取）──

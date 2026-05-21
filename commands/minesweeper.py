@@ -367,7 +367,7 @@ def _setup_embed(user: discord.abc.User, bet: int,
 class MinesSetupView(discord.ui.View):
     def __init__(self, uid: str, bet: int = DEFAULT_BET,
                  mines: int = DEFAULT_MINES):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.uid   = uid
         self.bet   = bet
         self.mines = mines

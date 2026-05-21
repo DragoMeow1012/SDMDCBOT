@@ -51,7 +51,9 @@ from data.fishing_data import (
     LUCK_POTION_II_PRICE, LUCK_POTION_II_LUCK,
     LUCK_POTION_III_PRICE,
     MEOW_BLESSING_MINUTES_BY_RARITY, MEOW_BLESSING_TAG_BONUS_MINUTES,
-    MEOW_BLESSING_MAX_MINUTES,
+    MEOW_BLESSING_MAX_MINUTES, MEOW_BLESSING_PRICE_MULT,
+    WEIGHT_CLASS_PROBS, WEIGHT_CLASS_PRICE_MULT, WEIGHT_CLASS_LABEL,
+    WEIGHT_CLASS_KG_RANGE, RARITY_BASE_WEIGHT_KG,
     RADAR_PRICE, RADAR_UNSEEN_BIAS,
     POTION_DURATION_MIN, POTION_STACK_CAP_MIN,
     SPECIAL_TAGS, SPECIAL_TAG_BASE_CHANCE, SPECIAL_TAG_POTION_CHANCE,
@@ -97,36 +99,55 @@ _DEFAULT_USER_REC: dict[str, Any] = {
 
 
 # ── 特殊 tag helpers ───────────────────────────────────────────────────
-def _split_stored_key(stored: str) -> tuple[str, str | None]:
-    """保溫箱 key 可能是 'fish_key' 或 'fish_key#tag'，解析回 (fish_key, tag)。"""
-    if '#' in stored:
-        fk, tag = stored.split('#', 1)
-        return fk, tag
-    return stored, None
+def _split_stored_key(stored: str) -> tuple[str, str | None, str | None]:
+    """保溫箱 key 格式：'fish_key[#tag][#w=class]'，解析回 (fish_key, tag, weight_class)。
+    向後相容：舊資料 'fish_key' / 'fish_key#tag' 解析時 weight_class 為 None（= normal）。"""
+    parts = stored.split('#')
+    fish_key = parts[0]
+    tag = None
+    weight_class = None
+    for p in parts[1:]:
+        if p.startswith('w='):
+            weight_class = p[2:] or None
+        elif tag is None:
+            tag = p
+    return fish_key, tag, weight_class
 
 
-def _join_stored_key(fish_key: str, tag: str | None) -> str:
-    return f'{fish_key}#{tag}' if tag else fish_key
+def _join_stored_key(fish_key: str, tag: str | None,
+                     weight_class: str | None = None) -> str:
+    parts = [fish_key]
+    if tag and tag in SPECIAL_TAGS:
+        parts.append(tag)
+    if weight_class and weight_class != 'normal':
+        parts.append(f'w={weight_class}')
+    return '#'.join(parts)
 
 
-def get_tagged_price(fish_key: str, tag: str | None) -> int:
+def get_tagged_price(fish_key: str, tag: str | None,
+                     weight_class: str | None = None) -> int:
     base = int(FISH_SPECS[fish_key]['price'])
     if tag and tag in SPECIAL_TAGS:
-        return int(base * SPECIAL_TAGS[tag])
+        base = int(base * SPECIAL_TAGS[tag])
+    if weight_class and weight_class in WEIGHT_CLASS_PRICE_MULT:
+        base = int(base * WEIGHT_CLASS_PRICE_MULT[weight_class])
     return base
 
 
-def display_fish_name(fish_key: str, tag: str | None) -> str:
+def display_fish_name(fish_key: str, tag: str | None,
+                      weight_class: str | None = None) -> str:
     name = FISH_SPECS[fish_key]['name']
     if tag and tag in SPECIAL_TAGS:
-        return f'【{tag}】{name}'
+        name = f'【{tag}】{name}'
+    if weight_class and weight_class in WEIGHT_CLASS_LABEL and WEIGHT_CLASS_LABEL[weight_class]:
+        name = f'{WEIGHT_CLASS_LABEL[weight_class]} {name}'
     return name
 
 
-def _roll_special_tag(*, boosted: bool, rod_bonus: float = 0.0) -> str | None:
-    """變體 tag 抽籤：base 1%（或喝藥水 III 拉到 2.5%）+ 釣竿 tag_bonus 加成。"""
-    base = SPECIAL_TAG_POTION_CHANCE if boosted else SPECIAL_TAG_BASE_CHANCE
-    chance = base + max(0.0, rod_bonus)
+def _roll_special_tag(*, boost_level: int, rod_bonus: float = 0.0) -> str | None:
+    """變體 tag 抽籤：每層藥水 III／祝福 把基礎 1% → 2.5% → ... 線性加成。"""
+    step = SPECIAL_TAG_POTION_CHANCE - SPECIAL_TAG_BASE_CHANCE
+    chance = SPECIAL_TAG_BASE_CHANCE + step * max(0, boost_level) + max(0.0, rod_bonus)
     if random.random() >= chance:
         return None
     return random.choice(list(SPECIAL_TAGS.keys()))
@@ -205,6 +226,35 @@ def potion_iii_active(uid: str) -> bool:
             or _get_active_buff_until(uid, 'luck_potion_iii_until') is not None)
 
 
+# ── stack 計數（祝福與藥水可疊加；mutex 仍只限制三種藥水彼此間）─────────
+def potion_i_stack(uid: str) -> int:
+    n = 1 if meow_blessing_active(uid) else 0
+    if _get_active_buff_until(uid, 'luck_potion_i_until'):
+        n += 1
+    return n
+
+
+def potion_ii_stack(uid: str) -> int:
+    n = 1 if meow_blessing_active(uid) else 0
+    if _get_active_buff_until(uid, 'luck_potion_ii_until'):
+        n += 1
+    return n
+
+
+def potion_iii_stack(uid: str) -> int:
+    n = 1 if meow_blessing_active(uid) else 0
+    if _get_active_buff_until(uid, 'luck_potion_iii_until'):
+        n += 1
+    return n
+
+
+def apply_blessing_multiplier(uid: str, price: int) -> int:
+    """祝福生效時，售價 ×MEOW_BLESSING_PRICE_MULT。"""
+    if meow_blessing_active(uid):
+        return int(price * MEOW_BLESSING_PRICE_MULT)
+    return price
+
+
 def radar_active(uid: str) -> bool:
     return _get_active_buff_until(uid, 'radar_until') is not None
 
@@ -243,70 +293,44 @@ def _other_active_potion(uid: str, self_kind: str) -> str | None:
 
 
 async def buy_luck_potion(uid: str, kind: str) -> tuple[bool, str, datetime | None]:
-    """kind = 'i' 或 'ii'。互斥檢查（三種幸運藥水互斥）+ 累計上限。"""
-    if kind not in ('i', 'ii'):
+    """kind = 'i' / 'ii' / 'iii'。買新覆蓋舊：任何既有藥水都會被清空，新藥水
+    從 now+POTION_DURATION_MIN 起算。三種藥水彼此互不共存（買哪個就只剩哪個）。
+    祝福屬獨立系統，不受影響。"""
+    if kind not in ('i', 'ii', 'iii'):
         return False, '未知藥水', None
     field = _POTION_FIELDS[kind][0]
-    price = LUCK_POTION_I_PRICE if kind == 'i' else LUCK_POTION_II_PRICE
-
-    blocker = _other_active_potion(uid, kind)
-    if blocker:
-        return False, f'❌ 目前有 {blocker} 生效中，幸運藥水不能共存', None
+    price = (LUCK_POTION_I_PRICE if kind == 'i'
+             else LUCK_POTION_II_PRICE if kind == 'ii'
+             else LUCK_POTION_III_PRICE)
 
     cur_balance = get_balance(uid)
     if cur_balance < price:
         return False, f'餘額不足，需要 {price:,}（你有 {cur_balance:,}）', None
 
-    # 計算新到期：未啟用 → now + 30min；已啟用 → 累加 30min，cap 3h
     now = datetime.now()
-    cur_exp = _get_active_buff_until(uid, field)
-    base = cur_exp if cur_exp else now
-    new_exp = base + timedelta(minutes=POTION_DURATION_MIN)
-    cap = now + timedelta(minutes=POTION_STACK_CAP_MIN)
-    if new_exp > cap:
-        return False, f'❌ 已達累計上限 {POTION_STACK_CAP_MIN // 60} 小時', cur_exp
+    new_exp = now + timedelta(minutes=POTION_DURATION_MIN)
 
-    # 扣錢 + 寫入
     await apply_delta(uid, -price)
     async with _FILE_LOCK:
         data = _load_all()
         rec = _get_or_init_rec(data, uid)
+        # 買新覆蓋舊：先清空全部三種藥水，再把目標寫入
+        for f, _ in _POTION_FIELDS.values():
+            rec[f] = None
         rec[field] = new_exp.isoformat()
         save_json(_FILE, data)
     return True, '', new_exp
 
 
 async def buy_luck_potion_iii(uid: str) -> tuple[bool, str, datetime | None]:
-    """幸運藥水 III：提升特殊 tag 機率。30 分 / 瓶，累計上限 3 小時。
-    與 I/II 互斥（三種幸運藥水不能共存）。"""
-    blocker = _other_active_potion(uid, 'iii')
-    if blocker:
-        return False, f'❌ 目前有 {blocker} 生效中，幸運藥水不能共存', None
-
-    price = LUCK_POTION_III_PRICE
-    cur_balance = get_balance(uid)
-    if cur_balance < price:
-        return False, f'餘額不足，需要 {price:,}（你有 {cur_balance:,}）', None
-
-    now = datetime.now()
-    cur_exp = _get_active_buff_until(uid, 'luck_potion_iii_until')
-    base = cur_exp if cur_exp else now
-    new_exp = base + timedelta(minutes=POTION_DURATION_MIN)
-    cap = now + timedelta(minutes=POTION_STACK_CAP_MIN)
-    if new_exp > cap:
-        return False, f'❌ 已達累計上限 {POTION_STACK_CAP_MIN // 60} 小時', cur_exp
-
-    await apply_delta(uid, -price)
-    async with _FILE_LOCK:
-        data = _load_all()
-        rec = _get_or_init_rec(data, uid)
-        rec['luck_potion_iii_until'] = new_exp.isoformat()
-        save_json(_FILE, data)
-    return True, '', new_exp
+    """向後相容包裝：等價於 buy_luck_potion(uid, 'iii')。"""
+    return await buy_luck_potion(uid, 'iii')
 
 
-def compute_meow_duration_minutes(fish_key: str, tag: str | None) -> int:
-    """投餵某條魚的祝福時長（分鐘）。trash 回 0。帶 tag +固定 2 小時，cap 8 小時。"""
+def compute_meow_duration_minutes(fish_key: str, tag: str | None,
+                                  weight_class: str | None = None) -> int:
+    """投餵某條魚的祝福時長（分鐘）。trash 回 0。
+    base = 稀有度時長 + tag 加成（固定 +120），再 × 重量倍率（用 WEIGHT_CLASS_PRICE_MULT），cap 360。"""
     spec = FISH_SPECS.get(fish_key)
     if not spec:
         return 0
@@ -314,7 +338,9 @@ def compute_meow_duration_minutes(fish_key: str, tag: str | None) -> int:
     if base <= 0:
         return 0
     bonus = MEOW_BLESSING_TAG_BONUS_MINUTES if (tag and tag in SPECIAL_TAGS) else 0
-    return min(MEOW_BLESSING_MAX_MINUTES, base + bonus)
+    weight_mult = WEIGHT_CLASS_PRICE_MULT.get(weight_class or 'normal', 1.0)
+    total = int((base + bonus) * weight_mult)
+    return min(MEOW_BLESSING_MAX_MINUTES, total)
 
 
 async def feed_meow(
@@ -325,10 +351,10 @@ async def feed_meow(
     Returns (ok, msg, new_until, duration_minutes)。
     一天一次；trash 不可投餵；保溫箱必須有此魚。
     """
-    fish_key, tag = _split_stored_key(stored_key)
+    fish_key, tag, weight_class = _split_stored_key(stored_key)
     if fish_key not in FISH_SPECS:
         return False, '未知魚種', None, 0
-    minutes = compute_meow_duration_minutes(fish_key, tag)
+    minutes = compute_meow_duration_minutes(fish_key, tag, weight_class)
     if minutes <= 0:
         return False, '🦞 小龍喵不吃這種魚', None, 0
 
@@ -471,6 +497,18 @@ def get_dex_tags(uid: str) -> dict[str, list[str]]:
     return get_user_rec(uid).get('dex_tags', {}) or {}
 
 
+def get_dex_max_weight(uid: str) -> dict[str, float]:
+    """fish_key -> 史上最重 kg。"""
+    raw = get_user_rec(uid).get('dex_max_weight', {}) or {}
+    return {k: float(v) for k, v in raw.items()}
+
+
+def get_catch_history(uid: str, limit: int = 20) -> list[dict]:
+    """回傳最近的釣魚紀錄（最近的在最後）。"""
+    hist = get_user_rec(uid).get('catch_history', []) or []
+    return list(hist[-limit:])
+
+
 async def adjust_rod(uid: str, key: str, *, add: bool) -> tuple[bool, str]:
     """加入 / 移除一支竿。移除已裝備竿時自動切到剩餘任一支或 None。"""
     if key not in ROD_SPECS:
@@ -519,7 +557,7 @@ async def adjust_bait(uid: str, key: str, delta: int) -> tuple[bool, str]:
 async def adjust_fish(uid: str, key: str, delta: int) -> tuple[bool, str]:
     """魚數量 ±N。key 可為 'fish_key' 或 'fish_key#tag'（特殊魚）。
     delta>0 時受保溫箱（動態）容量限制。"""
-    fish_key, tag = _split_stored_key(key)
+    fish_key, tag, weight_class = _split_stored_key(key)
     if fish_key not in FISH_SPECS:
         return False, f'未知魚種 {fish_key}'
     if tag and tag not in SPECIAL_TAGS:
@@ -578,24 +616,25 @@ _RARITY_BASE_SEC: dict[str, float] = {
 
 
 def _compute_duration(rod_key: str, bait_key: str, rarity: str,
-                      *, potion_i_active: bool = False) -> float:
+                      *, potion_i_stack: int = 0) -> float:
     """依稀有度決定基準時長 ± 20% 變化，再套 rod 時長縮短 + bait 平面減秒。
-    幸運藥水 I 生效時額外 -20% 時長。最終 clamp 到 [TIME_FLOOR, 60s]。
+    幸運藥水 I（每層）額外 -20% 時長 — 祝福 + 藥水可疊加。最終 clamp 到 [TIME_FLOOR, 60s]。
 
     稀有度基準時長：trash 8s / common 16s / rare 28s / epic 42s / legendary 60s。
     """
     base = _RARITY_BASE_SEC.get(rarity, 16.0) * random.uniform(0.8, 1.2)
     rod = ROD_SPECS[rod_key]
     bait = BAIT_SPECS[bait_key]
-    total_reduce = rod['time_reduce'] + (LUCK_POTION_I_REDUCE if potion_i_active else 0.0)
+    total_reduce = rod['time_reduce'] + LUCK_POTION_I_REDUCE * max(0, potion_i_stack)
     after_rod = base * (1.0 - min(total_reduce, 0.85))   # 上限 85% 縮短
     final = after_rod - bait['flat_time_reduce_sec']
     return min(60.0, max(TIME_FLOOR, final))
 
 
 def _roll_rarity(rod_key: str, bait_key: str,
-                 *, potion_ii_active: bool = False) -> str:
-    """套用 bait base 權重 + bait 特效 (+幸運藥水 II) → 加權隨機 rarity。
+                 *, potion_ii_stack: int = 0) -> str:
+    """套用 bait base 權重 + bait 特效 (+幸運藥水 II × 層數) → 加權隨機 rarity。
+    祝福 + 藥水可疊加（每層 +LUCK_POTION_II_LUCK）。
     釣竿不再影響稀有度（改為影響特殊變體 tag 機率，見 _roll_special_tag）。
     神話魚為獨立 roll：在所有 bait 邏輯之前判定；pool 為空時跳過避免空抽。
     """
@@ -608,9 +647,7 @@ def _roll_rarity(rod_key: str, bait_key: str,
         if random.random() < mythic_chance:
             return 'mythic'
 
-    luck = int(bait['extra_luck'])
-    if potion_ii_active:
-        luck += LUCK_POTION_II_LUCK
+    luck = int(bait['extra_luck']) + LUCK_POTION_II_LUCK * max(0, potion_ii_stack)
 
     # bait 10% 機率直接強制 epic+
     if bait['force_epic_plus_pct'] > 0 and random.random() < bait['force_epic_plus_pct']:
@@ -653,6 +690,22 @@ def _roll_species(rarity: str, *, dex: set[str] | None = None,
         if unseen and random.random() < RADAR_UNSEEN_BIAS:
             return random.choice(unseen)
     return random.choice(pool)
+
+
+def _roll_weight(rarity: str) -> tuple[str, float]:
+    """抽一個重量類別 + 取樣 kg。回 (weight_class, weight_kg)。"""
+    r = random.random()
+    cum = 0.0
+    chosen = 'normal'
+    for cls, p in WEIGHT_CLASS_PROBS:
+        cum += p
+        if r <= cum:
+            chosen = cls
+            break
+    base_kg = float(RARITY_BASE_WEIGHT_KG.get(rarity, 1.0))
+    lo, hi = WEIGHT_CLASS_KG_RANGE.get(chosen, (0.85, 1.20))
+    kg = base_kg * random.uniform(lo, hi)
+    return chosen, round(kg, 2)
 
 
 def _roll_price(fish_key: str) -> int:
@@ -736,8 +789,32 @@ async def _start_session_record(uid: str, *, rod_key: str, bait_key: str,
 
 async def _finish_session_record(uid: str, *, fish_key: str, price: int,
                                  is_new_species: bool, is_daily_first: bool,
-                                 tag: str | None = None) -> None:
-    """釣魚物理結束後寫 pending_catch（不 clear active_session）。tag 為特殊 tag。"""
+                                 tag: str | None = None,
+                                 weight_class: str | None = None,
+                                 weight_kg: float = 0.0) -> None:
+    """釣魚物理結束後寫 pending_catch（不 clear active_session）。tag 為特殊 tag、
+    weight_class/weight_kg 為新加的重量資訊（normal class 也應傳入便於後續紀錄）。
+
+    新魚種圖鑑獎勵 + 每日首釣獎勵：在此立即結算並 +錢包，不再走 sell/keep 結算路徑。
+    保溫箱只負責保管魚與顯示。
+    """
+    # 算「新魚種圖鑑」與「每日首釣」獎勵：tag × weight 倍率先吃進 base，再 × bonus rate × 祝福
+    def _bonus_after_mults(rate: float) -> int:
+        b = int(price)
+        if tag and tag in SPECIAL_TAGS:
+            b = int(b * SPECIAL_TAGS[tag])
+        if weight_class and weight_class in WEIGHT_CLASS_PRICE_MULT:
+            b = int(b * WEIGHT_CLASS_PRICE_MULT[weight_class])
+        out = int(b * rate)
+        if meow_blessing_active(uid):
+            out = int(out * MEOW_BLESSING_PRICE_MULT)
+        return out
+
+    is_real_fish = FISH_SPECS[fish_key]['rarity'] != 'trash'
+    new_species_bonus = _bonus_after_mults(NEW_SPECIES_BONUS_RATE) if (is_new_species and is_real_fish) else 0
+    daily_first_bonus = _bonus_after_mults(DAILY_FIRST_BONUS_RATE) if (is_daily_first and is_real_fish) else 0
+    total_immediate_bonus = new_species_bonus + daily_first_bonus
+
     async with _FILE_LOCK:
         data = _load_all()
         rec = _get_or_init_rec(data, uid)
@@ -745,9 +822,13 @@ async def _finish_session_record(uid: str, *, fish_key: str, price: int,
         sess['pending_catch'] = {
             'fish_key':       fish_key,
             'tag':            tag,
+            'weight_class':   weight_class,
+            'weight_kg':      float(weight_kg),
             'price':          int(price),
             'is_new_species': bool(is_new_species),
             'is_daily_first': bool(is_daily_first),
+            'new_species_bonus_paid': int(new_species_bonus),
+            'daily_first_bonus_paid': int(daily_first_bonus),
         }
         rec['active_session'] = sess
         # 同時把 dex 紀錄 + 首釣日期更新（這部分玩家無論出售/保留都要記）
@@ -760,8 +841,30 @@ async def _finish_session_record(uid: str, *, fish_key: str, price: int,
             tag_list = dex_tags.setdefault(fish_key, [])
             if tag not in tag_list:
                 tag_list.append(tag)
+        # 最大重量紀錄：保留每種 fish_key 史上最重
+        if weight_kg > 0:
+            dex_max_weight = rec.setdefault('dex_max_weight', {})
+            cur_max = float(dex_max_weight.get(fish_key, 0.0))
+            if weight_kg > cur_max:
+                dex_max_weight[fish_key] = round(float(weight_kg), 2)
+        # 釣魚歷史：最近 50 條
+        history = rec.setdefault('catch_history', [])
+        history.append({
+            'fish_key':     fish_key,
+            'tag':          tag,
+            'weight_class': weight_class,
+            'weight_kg':    round(float(weight_kg), 2) if weight_kg else 0.0,
+            'price':        int(price),
+            'ts':           datetime.now().isoformat(timespec='seconds'),
+        })
+        if len(history) > 50:
+            del history[:len(history) - 50]
         rec['first_catch_day'] = _today_str()
         save_json(_FILE, data)
+
+    # 新魚種圖鑑 + 每日首釣獎勵：立即入帳（鎖外做，與 fishing.json 寫入分離）
+    if total_immediate_bonus > 0:
+        await apply_delta(uid, total_immediate_bonus)
 
 
 async def _clear_session(uid: str) -> None:
@@ -781,36 +884,26 @@ def get_active_session(uid: str) -> dict | None:
 async def keep_pending(uid: str) -> tuple[bool, str]:
     """把 active_session.pending_catch 加入 fish inventory + clear session。
     垃圾理論上不會走到這（task 內已自動賣），但保險起見也做容錯：垃圾改為自動賣。
-    若帶 tag，存成 'fish_key#tag'。
-    首釣 / 新種 bonus 寫進 pending_bonus[stored_key]，賣魚時結算。"""
+    若帶 tag，存成 'fish_key#tag[#w=class]'。
+
+    新魚種 + 每日首釣獎勵已在 _finish_session_record 立即入帳，這裡不再算 pending bonus。
+    """
     sess = get_active_session(uid)
     if not sess or not sess.get('pending_catch'):
         return False, '沒有待處理的釣獲'
     pc = sess['pending_catch']
     fish_key = pc['fish_key']
     tag = pc.get('tag')
+    weight_class = pc.get('weight_class')
     if FISH_SPECS[fish_key]['rarity'] == 'trash':
         ok, msg, paid = await sell_pending(uid)
         return ok, msg
 
-    # 算待結算 bonus（與 sell_pending 公式一致：tag 倍率先吃進 base，再加百分比）
-    base = int(pc['price'])
-    if tag and tag in SPECIAL_TAGS:
-        base = int(base * SPECIAL_TAGS[tag])
-    bonus = 0
-    if pc.get('is_daily_first'):
-        bonus += int(base * DAILY_FIRST_BONUS_RATE)
-    if pc.get('is_new_species'):
-        bonus += int(base * NEW_SPECIES_BONUS_RATE)
-
-    stored = _join_stored_key(fish_key, tag)
+    stored = _join_stored_key(fish_key, tag, weight_class)
     async with _FILE_LOCK:
         data = _load_all()
         rec = _get_or_init_rec(data, uid)
         rec['fish'][stored] = int(rec['fish'].get(stored, 0)) + 1
-        if bonus > 0:
-            pb = rec.setdefault('pending_bonus', {})
-            pb[stored] = int(pb.get(stored, 0)) + bonus
         rec['active_session'] = None
         save_json(_FILE, data)
     return True, ''
@@ -828,18 +921,18 @@ async def sell_pending(uid: str) -> tuple[bool, str, int]:
             return False, '沒有待處理的釣獲', 0
         fish_key = pc['fish_key']
         tag = pc.get('tag')
+        weight_class = pc.get('weight_class')
         base = int(pc['price'])
-        # 特殊 tag 倍率（在 base 上）
+        # 特殊 tag + 重量倍率（在 base 上）
         if tag and tag in SPECIAL_TAGS:
             base = int(base * SPECIAL_TAGS[tag])
-        bonus = 0
-        if pc.get('is_daily_first'):
-            bonus += int(base * DAILY_FIRST_BONUS_RATE)
-        if pc.get('is_new_species'):
-            bonus += int(base * NEW_SPECIES_BONUS_RATE)
-        paid = max(0, base + bonus)
+        if weight_class and weight_class in WEIGHT_CLASS_PRICE_MULT:
+            base = int(base * WEIGHT_CLASS_PRICE_MULT[weight_class])
+        # 新魚種 / 每日首釣獎勵已在 _finish_session_record 立即入帳，這裡不再計入
+        paid = max(0, base)
         rec['active_session'] = None
         save_json(_FILE, data)
+    paid = apply_blessing_multiplier(uid, paid)
     if paid > 0:
         await apply_delta(uid, paid)
     return True, '', paid
@@ -861,10 +954,10 @@ async def sell_fish_from_pond(uid: str, stored_key: str, qty: int = 1) -> tuple[
     若該 stored_key 有 pending_bonus，賣時一次拿完。"""
     if qty <= 0:
         return False, '數量必須為正', 0
-    fish_key, tag = _split_stored_key(stored_key)
+    fish_key, tag, weight_class = _split_stored_key(stored_key)
     if fish_key not in FISH_SPECS:
         return False, '未知魚種', 0
-    unit_price = get_tagged_price(fish_key, tag)
+    unit_price = get_tagged_price(fish_key, tag, weight_class)
     total_price = unit_price * qty
 
     async with _FILE_LOCK:
@@ -881,7 +974,7 @@ async def sell_fish_from_pond(uid: str, stored_key: str, qty: int = 1) -> tuple[
         bonus = _consume_pending_bonus(rec, stored_key)
         save_json(_FILE, data)
 
-    paid = total_price + bonus
+    paid = apply_blessing_multiplier(uid, total_price + bonus)
     await apply_delta(uid, paid)
     return True, '', paid
 
@@ -894,7 +987,7 @@ async def sell_all_fish_by_rarity(uid: str, rarity: str) -> tuple[int, int]:
         total_count = 0
         total_price = 0
         for stored, n in list(rec['fish'].items()):
-            fk, tag = _split_stored_key(stored)
+            fk, tag, wc = _split_stored_key(stored)
             if fk not in FISH_SPECS:
                 continue
             if FISH_SPECS[fk]['rarity'] != rarity:
@@ -902,12 +995,13 @@ async def sell_all_fish_by_rarity(uid: str, rarity: str) -> tuple[int, int]:
             n = int(n)
             if n <= 0:
                 continue
-            gain = get_tagged_price(fk, tag) * n
+            gain = get_tagged_price(fk, tag, wc) * n
             gain += _consume_pending_bonus(rec, stored)
             rec['fish'].pop(stored, None)
             total_count += n
             total_price += gain
         save_json(_FILE, data)
+    total_price = apply_blessing_multiplier(uid, total_price)
     if total_price != 0:
         await apply_delta(uid, total_price)
     return total_count, total_price
@@ -920,18 +1014,19 @@ async def sell_all_fish(uid: str) -> tuple[int, int]:
         total_count = 0
         total_price = 0
         for stored, n in list(rec['fish'].items()):
-            fk, tag = _split_stored_key(stored)
+            fk, tag, wc = _split_stored_key(stored)
             if fk not in FISH_SPECS:
                 continue
             n = int(n)
             if n <= 0:
                 continue
-            gain = get_tagged_price(fk, tag) * n
+            gain = get_tagged_price(fk, tag, wc) * n
             gain += _consume_pending_bonus(rec, stored)
             rec['fish'].pop(stored, None)
             total_count += n
             total_price += gain
         save_json(_FILE, data)
+    total_price = apply_blessing_multiplier(uid, total_price)
     if total_price != 0:
         await apply_delta(uid, total_price)
     return total_count, total_price
@@ -1027,37 +1122,46 @@ async def _save_gifts(data: dict) -> None:
 
 
 async def create_gift(*, from_uid: str, to_uid: str, category: str, key: str,
-                      qty: int, guild_id: int, channel_id: int) -> tuple[bool, str, str | None]:
-    """先從 sender 扣物品，再寫 gifts.json。回 (ok, msg, gift_id)。"""
+                      qty: int, guild_id: int, channel_id: int,
+                      is_purchase: bool = False,
+                      paid_amount: int = 0) -> tuple[bool, str, str | None]:
+    """寫 gifts.json。回 (ok, msg, gift_id)。
+
+    is_purchase=False（魚）：從 sender 扣物品。
+    is_purchase=True（其他類別 — 從商店買來送）：呼叫端已先扣錢，這裡只負責寫入 pending。
+    """
     if from_uid == to_uid:
         return False, '不能送禮給自己', None
     if qty <= 0:
         return False, '數量必須為正', None
 
-    # 1. 從 sender 扣
-    if category == 'rod':
-        ok, err = await adjust_rod(from_uid, key, add=False)
-    elif category == 'bait':
-        ok, err = await adjust_bait(from_uid, key, -qty)
-    elif category == 'fish':
-        ok, err = await adjust_fish(from_uid, key, -qty)
-    else:
-        return False, f'不支援的贈禮類別：{category}', None
-    if not ok:
-        return False, err, None
+    # 非購買贈禮 → 從 sender 扣物品
+    if not is_purchase:
+        if category == 'rod':
+            ok, err = await adjust_rod(from_uid, key, add=False)
+        elif category == 'bait':
+            ok, err = await adjust_bait(from_uid, key, -qty)
+        elif category == 'fish':
+            ok, err = await adjust_fish(from_uid, key, -qty)
+        else:
+            return False, f'不支援的贈禮類別：{category}', None
+        if not ok:
+            return False, err, None
 
     gift_id = secrets.token_hex(8)
     data = _load_gifts()
     data.setdefault('gifts', {})[gift_id] = {
-        'id':         gift_id,
-        'from_uid':   from_uid,
-        'to_uid':     to_uid,
-        'category':   category,
-        'key':        key,
-        'qty':        int(qty),
-        'guild_id':   int(guild_id),
-        'channel_id': int(channel_id),
-        'expires_at': (datetime.now() + timedelta(hours=GIFT_EXPIRE_HOURS)).isoformat(),
+        'id':           gift_id,
+        'from_uid':     from_uid,
+        'to_uid':       to_uid,
+        'category':     category,
+        'key':          key,
+        'qty':          int(qty),
+        'guild_id':     int(guild_id),
+        'channel_id':   int(channel_id),
+        'is_purchase':  bool(is_purchase),
+        'paid_amount':  int(paid_amount),
+        'expires_at':   (datetime.now() + timedelta(hours=GIFT_EXPIRE_HOURS)).isoformat(),
     }
     await _save_gifts(data)
     return True, '', gift_id
@@ -1083,6 +1187,12 @@ async def claim_gift(gift_id: str, claimer_uid: str) -> tuple[bool, str]:
         ok, err = await adjust_bait(claimer_uid, key, +qty)
     elif cat == 'fish':
         ok, err = await adjust_fish(claimer_uid, key, +qty)
+    elif cat == 'reverse':
+        from commands.shop import _atomic_add_reverse
+        ok, err = await _atomic_add_reverse(claimer_uid, qty)
+    elif cat == 'miner':
+        from commands.shop import _atomic_add_miner
+        ok, err = await _atomic_add_miner(claimer_uid, qty)
     else:
         return False, '不支援的贈禮類別'
     if not ok:
@@ -1094,16 +1204,26 @@ async def claim_gift(gift_id: str, claimer_uid: str) -> tuple[bool, str]:
 
 
 async def refund_gift(gift_id: str) -> tuple[bool, str]:
-    """把物品退還給原贈禮者（用於拒收 / 過期 / claim 失敗）。"""
+    """把物品 / 金額退還給原贈禮者（用於拒收 / 過期 / claim 失敗）。"""
     data = _load_gifts()
     g = (data.get('gifts') or {}).get(gift_id)
     if g is None:
         return False, '此贈禮不存在'
 
+    sender = g['from_uid']
+
+    # 購買贈禮 → 退錢
+    if g.get('is_purchase'):
+        amt = int(g.get('paid_amount', 0))
+        if amt > 0:
+            await apply_delta(sender, amt)
+        data['gifts'].pop(gift_id, None)
+        await _save_gifts(data)
+        return True, ''
+
     cat = g['category']
     key = g['key']
     qty = int(g['qty'])
-    sender = g['from_uid']
     if cat == 'rod':
         if key in get_rods(sender):
             # 贈禮者已經有同一支竿（不可能擁有兩支）→ 補錢
@@ -1141,16 +1261,10 @@ async def cleanup_active_sessions_on_restart() -> None:
             fk = pc.get('fish_key')
             if fk and fk in FISH_SPECS:
                 if FISH_SPECS[fk]['rarity'] == 'trash':
-                    # 直接賣出（低價回收）
+                    # 直接賣出（低價回收）— 新魚種/首釣獎勵已在 catch 時立即入帳
                     price = int(pc.get('price', 0))
-                    bonus = 0
-                    if pc.get('is_daily_first'):
-                        bonus += int(price * DAILY_FIRST_BONUS_RATE)
-                    if pc.get('is_new_species'):
-                        bonus += int(price * NEW_SPECIES_BONUS_RATE)
-                    paid = max(0, price + bonus)
-                    if paid > 0:
-                        await apply_delta(uid, paid)
+                    if price > 0:
+                        await apply_delta(uid, price)
                     autosold += 1
                 else:
                     fish = rec.setdefault('fish', {})
@@ -1531,12 +1645,12 @@ class FishingMainView(discord.ui.View):
         if not ok:
             await interaction.response.send_message(err, ephemeral=True)
             return
-        p1_on    = potion_i_active(self.uid)
-        p2_on    = potion_ii_active(self.uid)
+        p1_stack = potion_i_stack(self.uid)
+        p2_stack = potion_ii_stack(self.uid)
         radar_on = radar_active(self.uid)
-        rarity   = _roll_rarity(rod_key, bait_key, potion_ii_active=p2_on)
+        rarity   = _roll_rarity(rod_key, bait_key, potion_ii_stack=p2_stack)
         fish_key = _roll_species(rarity, dex=get_dex(self.uid), radar_active=radar_on)
-        duration = _compute_duration(rod_key, bait_key, rarity, potion_i_active=p1_on)
+        duration = _compute_duration(rod_key, bait_key, rarity, potion_i_stack=p1_stack)
         story_tag, s1, s2, s3 = _script_pick_story(
             name='小龍喵',
             rod=ROD_SPECS[rod_key]['name'],
@@ -1755,7 +1869,7 @@ class FishingProgressView(discord.ui.View):
     """釣魚等待中的 view — 沒有可互動按鈕，避免玩家中途亂按。"""
 
     def __init__(self, uid: str):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.uid = uid
         wait_btn = discord.ui.Button(
             label='等待中…',
@@ -1808,15 +1922,18 @@ async def _run_fishing_task(*, uid: str, public_msg: discord.Message,
         tag: str | None = None
         if FISH_SPECS[fish_key]['rarity'] != 'trash':
             rod_bonus = float(ROD_SPECS.get(rod_key, {}).get('tag_bonus', 0.0))
-            tag = _roll_special_tag(boosted=potion_iii_active(uid), rod_bonus=rod_bonus)
+            tag = _roll_special_tag(boost_level=potion_iii_stack(uid), rod_bonus=rod_bonus)
 
         rarity_now = FISH_SPECS[fish_key]['rarity']
+        # 重量 roll：按 WEIGHT_CLASS_PROBS 抽 class，再按 rarity base kg × class 倍率取樣
+        weight_class, weight_kg = _roll_weight(rarity_now)
         # 上鉤頁：玩家需在 HOOK_TIMEOUT_SEC[rarity] 內按「收竿」；超時魚跑掉 + 餌已扣不退
         timeout_sec = float(HOOK_TIMEOUT_SEC.get(rarity_now, 30.0))
         view = HookedView(
             uid=uid, public_msg=public_msg, fisher=fisher,
             rod_key=rod_key, bait_key=bait_key,
             fish_key=fish_key, tag=tag, price=price,
+            weight_class=weight_class, weight_kg=weight_kg,
             story_full=story_full, timeout_sec=timeout_sec,
         )
         embed = _hooked_embed(fisher, fish_key=fish_key, tag=tag,
@@ -1870,6 +1987,7 @@ class HookedView(discord.ui.View):
     def __init__(self, *, uid: str, public_msg: discord.Message,
                  fisher: discord.abc.User, rod_key: str, bait_key: str,
                  fish_key: str, tag: str | None, price: int,
+                 weight_class: str, weight_kg: float,
                  story_full: str, timeout_sec: float):
         super().__init__(timeout=timeout_sec)
         self.uid = uid
@@ -1880,6 +1998,8 @@ class HookedView(discord.ui.View):
         self.fish_key = fish_key
         self.tag = tag
         self.price = price
+        self.weight_class = weight_class
+        self.weight_kg = float(weight_kg)
         self.story_full = story_full
         self.resolved = False   # True 表示玩家已按 收竿 或 超時處理完畢
 
@@ -1913,6 +2033,7 @@ class HookedView(discord.ui.View):
             self.uid, fish_key=self.fish_key, price=self.price,
             is_new_species=is_new, is_daily_first=is_daily_first,
             tag=self.tag,
+            weight_class=self.weight_class, weight_kg=self.weight_kg,
         )
 
         rarity = FISH_SPECS[self.fish_key]['rarity']
@@ -2000,7 +2121,7 @@ class FishingEscapedView(discord.ui.View):
 
     def __init__(self, *, uid: str, public_msg: discord.Message,
                  fisher: discord.abc.User, last_rod: str, last_bait: str):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.uid = uid
         self.public_msg = public_msg
         self.fisher = fisher
@@ -2104,16 +2225,21 @@ def _result_embed(user: discord.abc.User, uid: str,
     pc = sess['pending_catch']
     fk = pc['fish_key']
     tag = pc.get('tag')
+    weight_class = pc.get('weight_class')
+    weight_kg = float(pc.get('weight_kg') or 0.0)
     spec = FISH_SPECS[fk]
     rarity = spec['rarity']
     base = int(pc['price'])
     if tag and tag in SPECIAL_TAGS:
         base = int(base * SPECIAL_TAGS[tag])
+    if weight_class and weight_class in WEIGHT_CLASS_PRICE_MULT:
+        base = int(base * WEIGHT_CLASS_PRICE_MULT[weight_class])
 
-    disp_name = display_fish_name(fk, tag)
+    disp_name = display_fish_name(fk, tag, weight_class)
+    kg_suffix = f' ({weight_kg:.2f} KG)' if weight_kg > 0 else ''
     lines: list[str] = [
         f'{RARITY_EMOJI[rarity]} 恭喜 **{user.display_name}** 釣到了一條 '
-        f'**[{RARITY_LABEL[rarity]}] {disp_name}**',
+        f'**[{RARITY_LABEL[rarity]}] {disp_name}**{kg_suffix}',
     ]
     if tag and tag in SPECIAL_TAGS:
         lines.append(f'✨ 特殊變體：**【{tag}】** （售價 ×{SPECIAL_TAGS[tag]}）')
@@ -2122,16 +2248,25 @@ def _result_embed(user: discord.abc.User, uid: str,
         lines += ['', f'**Buff:** {buff}']
     if story_line:
         lines += ['', '**🎬 環境小事件:**', '', story_line]
+
+    # 新魚種 / 每日首釣獎勵已立即入帳；不論 sell/keep 都顯示
+    new_sp_bonus = int(pc.get('new_species_bonus_paid') or 0)
+    df_bonus = int(pc.get('daily_first_bonus_paid') or 0)
+    if new_sp_bonus > 0:
+        lines += ['', f'🆕 新魚種圖鑑獎勵 **+{_fmt_price(new_sp_bonus)}** 碎片（已入帳）']
+    if df_bonus > 0:
+        lines.append(f'🌅 每日首釣獎勵 **+{_fmt_price(df_bonus)}** 碎片（已入帳）')
+
     if sold is not None:
         sign = '💸 罰款' if sold < 0 else '💰 售出'
+        extras: list[str] = []
+        if weight_class and weight_class in WEIGHT_CLASS_PRICE_MULT and weight_class != 'normal':
+            extras.append(f'重量加成: ×{WEIGHT_CLASS_PRICE_MULT[weight_class]}')
+        suffix = f'（含：{"；".join(extras)}）' if extras else ''
         lines += [
             '',
-            f'{sign}：**{_fmt_price(sold)}** 咕嚕喵碎片',
+            f'{sign}：**{_fmt_price(sold)}** 碎片 {suffix}'.rstrip(),
         ]
-        if pc.get('is_daily_first'):
-            lines.append('🌅 含每日首釣加成 (+50%)')
-        if pc.get('is_new_species'):
-            lines.append('🆕 含新魚種獎勵 (+200%)')
     elif kept:
         if rarity == 'trash':
             lines += ['', '🚯 此為垃圾，已丟回水裡（不入保溫箱）']
@@ -2141,21 +2276,7 @@ def _result_embed(user: discord.abc.User, uid: str,
         if rarity == 'trash':
             lines += ['', f'_預設售價：{_fmt_price(base)}（垃圾選保留會直接丟掉）_']
         else:
-            preview = base
-            if pc.get('is_daily_first'):
-                preview += int(base * DAILY_FIRST_BONUS_RATE)
-            if pc.get('is_new_species'):
-                preview += int(base * NEW_SPECIES_BONUS_RATE)
-            extras: list[str] = []
-            if pc.get('is_daily_first'):
-                extras.append('每日首釣 +50%')
-            if pc.get('is_new_species'):
-                extras.append('新魚種 +200%')
-            lines += [
-                '',
-                f'_出售可得：**{_fmt_price(preview)}** 碎片_'
-                + (f' （含：{"、".join(extras)}）' if extras else ''),
-            ]
+            lines += ['', f'_出售可得：**{_fmt_price(base)}** 碎片_']
 
     # 帶 tag 時：改 title 強調、用 tag 顏色覆蓋稀有度色（讓變體在訊息列就顯眼）
     if tag and tag in SPECIAL_TAG_COLOR:
@@ -2375,14 +2496,14 @@ class FishingResultView(discord.ui.View):
             return
 
         # 預先 roll 魚 + 重抽劇本（每次甩勾都換，全文一次顯示）
-        p1_on    = potion_i_active(self.uid)
-        p2_on    = potion_ii_active(self.uid)
+        p1_stack = potion_i_stack(self.uid)
+        p2_stack = potion_ii_stack(self.uid)
         radar_on = radar_active(self.uid)
-        new_rarity   = _roll_rarity(rod_key, bait_key, potion_ii_active=p2_on)
+        new_rarity   = _roll_rarity(rod_key, bait_key, potion_ii_stack=p2_stack)
         new_fish_key = _roll_species(new_rarity, dex=get_dex(self.uid),
                                      radar_active=radar_on)
         duration = _compute_duration(rod_key, bait_key, new_rarity,
-                                     potion_i_active=p1_on)
+                                     potion_i_stack=p1_stack)
         new_tag, new_s1, new_s2, new_s3 = _script_pick_story(
             name='小龍喵',
             rod=ROD_SPECS[rod_key]['name'],
@@ -2575,7 +2696,7 @@ _DEX_PER_PAGE = 25
 class DexView(discord.ui.View):
     def __init__(self, uid: str, root_interaction: discord.Interaction, *, page: int,
                  close_on_back: bool = False):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.uid = uid
         self.root_interaction = root_interaction
         self.close_on_back = close_on_back
@@ -2594,6 +2715,7 @@ class DexView(discord.ui.View):
     def build_embed(self, user: discord.abc.User) -> discord.Embed:
         dex = get_dex(self.uid)
         dex_tags = get_dex_tags(self.uid)
+        dex_max_w = get_dex_max_weight(self.uid)
         fish = get_fish(self.uid)
         start = self.page * _DEX_PER_PAGE
         end = start + _DEX_PER_PAGE
@@ -2610,6 +2732,9 @@ class DexView(discord.ui.View):
             owned_txt = f' × {owned}' if owned > 0 else ''
             spec = FISH_SPECS[k]
             line = f'　{mark} {spec["name"]}{owned_txt} `${spec["price"]:,}`'
+            max_w = dex_max_w.get(k)
+            if max_w:
+                line += f'　⚖️ {max_w:.2f}kg'
             caught_tags = dex_tags.get(k) or []
             if caught_tags:
                 line += '　✨ ' + ' '.join(f'【{t}】' for t in caught_tags)
@@ -2623,6 +2748,44 @@ class DexView(discord.ui.View):
             color=discord.Color.dark_teal(),
         )
         embed.set_footer(text=f'頁碼 {self.page + 1}/{self.total_pages}')
+        return embed
+
+    def build_history_embed(self, user: discord.abc.User) -> discord.Embed:
+        """釣魚歷史：最近 20 條（新到舊）。"""
+        hist = list(reversed(get_catch_history(self.uid, limit=20)))
+        if not hist:
+            desc = '_(還沒有釣魚紀錄)_'
+        else:
+            lines: list[str] = []
+            for entry in hist:
+                fk = entry.get('fish_key')
+                if fk not in FISH_SPECS:
+                    continue
+                tag = entry.get('tag')
+                wc = entry.get('weight_class')
+                kg = float(entry.get('weight_kg') or 0.0)
+                price = int(entry.get('price') or 0)
+                ts = entry.get('ts', '')
+                spec = FISH_SPECS[fk]
+                disp = display_fish_name(fk, tag, wc)
+                kg_txt = f' {kg:.2f}kg' if kg > 0 else ''
+                # ISO ts → Discord 相對時間
+                try:
+                    dt = datetime.fromisoformat(ts)
+                    when = f'<t:{int(dt.timestamp())}:R>'
+                except Exception:
+                    when = ts
+                lines.append(
+                    f'{RARITY_EMOJI[spec["rarity"]]} **{disp}**{kg_txt}'
+                    f' `${price:,}` {when}'
+                )
+            desc = '\n'.join(lines)
+        embed = discord.Embed(
+            title='🎣 釣魚歷史（最近 20 筆）',
+            description=desc,
+            color=discord.Color.dark_teal(),
+        )
+        embed.set_footer(text=user.display_name)
         return embed
 
     def _rarity_first_page(self, rarity: str) -> int:
@@ -2702,6 +2865,12 @@ class DexView(discord.ui.View):
         next_btn.callback = self._next
         self.add_item(next_btn)
 
+        history_btn = discord.ui.Button(
+            label='📜 釣魚歷史', style=discord.ButtonStyle.secondary, row=2,
+        )
+        history_btn.callback = self._on_history
+        self.add_item(history_btn)
+
         back_btn = discord.ui.Button(
             label='✖️ 關閉' if self.close_on_back else '⬅️ 返回主面板',
             style=discord.ButtonStyle.danger if self.close_on_back
@@ -2710,6 +2879,14 @@ class DexView(discord.ui.View):
         )
         back_btn.callback = self._back
         self.add_item(back_btn)
+
+    async def _on_history(self, interaction: discord.Interaction) -> None:
+        if not await self._check_owner(interaction):
+            return
+        # 同一個 view 但顯示歷史 embed；按下「關閉」走原回程
+        await interaction.response.edit_message(
+            embed=self.build_history_embed(interaction.user), view=self,
+        )
 
     async def _check_owner(self, interaction: discord.Interaction) -> bool:
         if str(interaction.user.id) != self.uid:
@@ -2787,12 +2964,12 @@ class PondInventoryView(discord.ui.View):
 
     def __init__(self, uid: str, *, page: int = 0,
                  root_interaction: discord.Interaction | None = None):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.uid = uid
         self.page = page
         self.root_interaction = root_interaction
         def _sort_key(kv):
-            fk, _ = _split_stored_key(kv[0])
+            fk, _, _ = _split_stored_key(kv[0])
             return (list(RARITIES).index(FISH_SPECS[fk]['rarity']), kv[0])
         self._owned: list[tuple[str, int]] = sorted(
             ((k, int(v)) for k, v in get_fish(self.uid).items()
@@ -2807,10 +2984,19 @@ class PondInventoryView(discord.ui.View):
     def build_embed(self, user: discord.abc.User) -> discord.Embed:
         cap = get_fish_pond_cap(self.uid)
         total_count = sum(n for _, n in self._owned)
+        rec = get_user_rec(self.uid)
+        pb = rec.get('pending_bonus') or {}
+        blessing_on = meow_blessing_active(self.uid)
+        mult = MEOW_BLESSING_PRICE_MULT if blessing_on else 1.0
+
+        def _final_unit(fk, tag, wc):
+            return int(get_tagged_price(fk, tag, wc) * mult)
+
         total_value = 0
         for k, n in self._owned:
-            fk, tag = _split_stored_key(k)
-            total_value += get_tagged_price(fk, tag) * n
+            fk, tag, wc = _split_stored_key(k)
+            line_total = _final_unit(fk, tag, wc) * n + int(pb.get(k, 0) * mult)
+            total_value += line_total
         if not self._owned:
             desc = '_(保溫箱裡沒有任何魚)_'
         else:
@@ -2818,22 +3004,27 @@ class PondInventoryView(discord.ui.View):
             slice_ = self._owned[start:start + self._PAGE_SIZE]
             lines: list[str] = []
             for k, n in slice_:
-                fk, tag = _split_stored_key(k)
+                fk, tag, wc = _split_stored_key(k)
                 spec = FISH_SPECS[fk]
-                disp = display_fish_name(fk, tag)
-                unit_price = get_tagged_price(fk, tag)
+                disp = display_fish_name(fk, tag, wc)
+                unit_price = _final_unit(fk, tag, wc)
+                bonus = int(pb.get(k, 0) * mult)
+                bonus_txt = f'　🌅 每日首釣 +{bonus:,}' if bonus else ''
                 lines.append(
                     f'{RARITY_EMOJI[spec["rarity"]]} **{disp}** × {n}'
-                    f' `${unit_price:,}/條`'
+                    f' `${unit_price:,}/條`{bonus_txt}'
                 )
             desc = '\n'.join(lines)
+        footer = (
+            f'\n\n💰 全賣可得：**{total_value:,}** 碎片'
+            f'\n💼 目前餘額：**{get_balance(self.uid):,}** 碎片'
+        )
+        if blessing_on:
+            footer += (f'\n🍀 小龍喵祝福加成中（售價 ×{MEOW_BLESSING_PRICE_MULT}）')
         return discord.Embed(
             title=f'📦 我的保溫箱 ({total_count}/{cap})'
                   f' — 第 {self.page + 1}/{self.total_pages} 頁',
-            description=desc + (
-                f'\n\n💰 全賣可得：**{total_value:,}** 碎片'
-                f'\n💼 目前餘額：**{get_balance(self.uid):,}** 碎片'
-            ),
+            description=desc + footer,
             color=discord.Color.dark_teal(),
         )
 
@@ -2843,12 +3034,14 @@ class PondInventoryView(discord.ui.View):
 
         # Row 0: Select 選某一品種
         if slice_:
+            blessing_on = meow_blessing_active(self.uid)
+            mult = MEOW_BLESSING_PRICE_MULT if blessing_on else 1.0
             options: list[discord.SelectOption] = []
             for k, n in slice_[:25]:
-                fk, tag = _split_stored_key(k)
+                fk, tag, wc = _split_stored_key(k)
                 spec = FISH_SPECS[fk]
-                disp = display_fish_name(fk, tag)
-                unit = get_tagged_price(fk, tag)
+                disp = display_fish_name(fk, tag, wc)
+                unit = int(get_tagged_price(fk, tag, wc) * mult)
                 options.append(discord.SelectOption(
                     label=f'{disp} × {n}'[:100],
                     description=f'{RARITY_LABEL[spec["rarity"]]} | ${unit:,}/條',
@@ -3025,8 +3218,8 @@ class _PondSellQtyModal(discord.ui.Modal, title='保溫箱賣魚 — 數量'):
             )
         except discord.HTTPException:
             pass
-        fk, tag = _split_stored_key(self.fish_key)
-        name = display_fish_name(fk, tag)
+        fk, tag, wc = _split_stored_key(self.fish_key)
+        name = display_fish_name(fk, tag, wc)
         msg = (f'✅ 已賣出 **{name}** × {qty}，獲得 `{gain:,}` 碎片'
                if ok else f'❌ {err}')
         try:
@@ -3043,13 +3236,13 @@ class FeedMeowView(discord.ui.View):
 
     def __init__(self, uid: str, *, page: int,
                  root_interaction: discord.Interaction):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.uid = uid
         self.page = page
         self.root_interaction = root_interaction
 
         def _sort_key(kv):
-            fk, _ = _split_stored_key(kv[0])
+            fk, _, _ = _split_stored_key(kv[0])
             return (list(RARITIES).index(FISH_SPECS[fk]['rarity']), kv[0])
         # 過濾掉 trash（小龍喵不吃）
         self._owned: list[tuple[str, int]] = sorted(
@@ -3072,8 +3265,10 @@ class FeedMeowView(discord.ui.View):
             '',
             '挑一條魚當作貢品，小龍喵會給你祝福：',
             '幸運Ⅰ（時長 -20%）/ 幸運Ⅱ（+運氣）/ 幸運Ⅲ（變體機率 ↑）三種**同時生效**。',
+            f'💰 祝福期間售魚價格 **×{MEOW_BLESSING_PRICE_MULT}**。',
+            '與花錢買的幸運藥水**可疊加**（藥水之間仍互斥）。',
             '',
-            '時長：稀有度決定基數，帶變體 tag 額外 +120 分，上限 6 小時。',
+            '時長：稀有度 + 變體 tag (+120) 再 × 重量倍率（light 0.75 / normal 1 / heavy 1.4 / super 2.5），上限 6h。',
             f'└ common 30m / rare 60m / epic 120m / legendary 180m / mythic 240m',
             '',
             '每天只能投餵 1 次。',
@@ -3090,10 +3285,10 @@ class FeedMeowView(discord.ui.View):
             slice_ = self._owned[start:start + self._PAGE_SIZE]
             lines = []
             for k, n in slice_:
-                fk, tag = _split_stored_key(k)
+                fk, tag, wc = _split_stored_key(k)
                 spec = FISH_SPECS[fk]
-                disp = display_fish_name(fk, tag)
-                mins = compute_meow_duration_minutes(fk, tag)
+                disp = display_fish_name(fk, tag, wc)
+                mins = compute_meow_duration_minutes(fk, tag, wc)
                 lines.append(
                     f'{RARITY_EMOJI[spec["rarity"]]} **{disp}** × {n}'
                     f' → 🍀 {mins} 分鐘'
@@ -3116,10 +3311,10 @@ class FeedMeowView(discord.ui.View):
         if slice_ and not already:
             options: list[discord.SelectOption] = []
             for k, n in slice_:
-                fk, tag = _split_stored_key(k)
+                fk, tag, wc = _split_stored_key(k)
                 spec = FISH_SPECS[fk]
-                disp = display_fish_name(fk, tag)
-                mins = compute_meow_duration_minutes(fk, tag)
+                disp = display_fish_name(fk, tag, wc)
+                mins = compute_meow_duration_minutes(fk, tag, wc)
                 options.append(discord.SelectOption(
                     label=f'{disp} × {n}'[:100],
                     description=f'{RARITY_LABEL[spec["rarity"]]} | 祝福 {mins} 分鐘',
@@ -3182,8 +3377,8 @@ class FeedMeowView(discord.ui.View):
         if not ok:
             await interaction.response.send_message(f'❌ {err}', ephemeral=True)
             return
-        fk, tag = _split_stored_key(key)
-        name = display_fish_name(fk, tag)
+        fk, tag, wc = _split_stored_key(key)
+        name = display_fish_name(fk, tag, wc)
         msg = (
             f'🦞 小龍喵心滿意足地吞下了 **{name}**！\n'
             f'✨ 獲得祝福 **{minutes} 分鐘**'
@@ -3233,7 +3428,7 @@ class RodShopView(discord.ui.View):
     def __init__(self, uid: str, root_interaction: discord.Interaction,
                  *, back_to_shop_equip: bool = False,
                  back_to_fishing_main: bool = False):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.uid = uid
         self.root_interaction = root_interaction
         self.back_to_shop_equip = back_to_shop_equip
@@ -3358,7 +3553,7 @@ class BaitShopView(discord.ui.View):
     def __init__(self, uid: str, root_interaction: discord.Interaction, *, page: int,
                  back_to_shop_equip: bool = False,
                  back_to_fishing_main: bool = False):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.uid = uid
         self.root_interaction = root_interaction
         self.page = page
@@ -3552,7 +3747,7 @@ class BaitBuyModal(discord.ui.Modal, title='購買魚餌'):
 # ── 頻道白名單 View ─────────────────────────────────────────────────────
 class WhitelistView(discord.ui.View):
     def __init__(self, uid: str, root_interaction: discord.Interaction):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.uid = uid
         self.root_interaction = root_interaction
         self._build()

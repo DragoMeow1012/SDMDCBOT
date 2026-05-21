@@ -216,7 +216,7 @@ def _result_embed(user: discord.abc.User, bet: int,
 class DiceSetupView(discord.ui.View):
     def __init__(self, uid: str, bet: int = DEFAULT_BET,
                  category: str | None = None, detail: int | None = None):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.uid      = uid
         self.bet      = bet
         self.category = category

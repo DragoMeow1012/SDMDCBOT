@@ -492,7 +492,7 @@ class BlackjackView(discord.ui.View):
 
     def __init__(self, uid: str, base_bet: int, game: BlackjackGame,
                  committed: int):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.uid       = uid
         self.base_bet  = base_bet     # 起手下注（split / double 都加扣這個基準）
         self.game      = game
@@ -626,7 +626,7 @@ def _setup_embed(user: discord.abc.User, bet: int,
 class BlackjackSetupView(discord.ui.View):
     def __init__(self, uid: str, bet: int = DEFAULT_BET,
                  side_21_3: bool = False):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.uid       = uid
         self.bet       = bet
         self.side_21_3 = side_21_3

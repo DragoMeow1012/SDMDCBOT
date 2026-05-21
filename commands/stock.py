@@ -748,7 +748,7 @@ class StockSystemView(View):
     def __init__(self, pages: list[discord.Embed] | None = None,
                  page_idx: int = 0,
                  *, back_to_shop=None, refresh_target=None) -> None:
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.pages          = pages or []
         self.page_idx       = page_idx
         self.back_to_shop   = back_to_shop
@@ -831,7 +831,7 @@ class AccountPagerView(View):
     def __init__(self, pages: list[discord.Embed],
                  page_idx: int = 0,
                  *, owner_uid: str | None = None) -> None:
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.pages     = pages
         self.page_idx  = page_idx
         self.owner_uid = owner_uid
@@ -887,7 +887,7 @@ class UseItemView(View):
 
     def __init__(self, uid: str, *, root_interaction: discord.Interaction,
                  pages: list[discord.Embed], page_idx: int):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.uid = uid
         self.root_interaction = root_interaction
         self.pages = pages
@@ -1291,7 +1291,7 @@ class MarginOpenFinalModal(Modal):
 class MarginOpenSourceView(View):
     def __init__(self, *, ticker: str, currency: str, price_raw: float,
                  pos_type: str, back_to_shop, refresh_target) -> None:
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.ticker, self.currency = ticker, currency
         self.price_raw, self.pos_type = price_raw, pos_type
         self.back_to_shop = back_to_shop
@@ -1464,7 +1464,7 @@ class MarginPartialCloseModal(Modal):
 class MarginCloseOptionsView(View):
     def __init__(self, *, ticker: str, max_shares: int,
                  back_to_shop, refresh_target) -> None:
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.ticker, self.max_shares = ticker, max_shares
         self.back_to_shop = back_to_shop
         self.refresh_target = refresh_target
@@ -1564,7 +1564,7 @@ class _MarginCloseSelect(discord.ui.Select):
 class MarginCloseSelectView(View):
     def __init__(self, positions: dict[str, Any],
                  *, back_to_shop, refresh_target) -> None:
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.back_to_shop = back_to_shop
         self.refresh_target = refresh_target
         self.add_item(_MarginCloseSelect(
@@ -1709,7 +1709,7 @@ class _MarginAddSelect(discord.ui.Select):
 class MarginAddSelectView(View):
     def __init__(self, positions: dict[str, Any],
                  *, back_to_shop, refresh_target) -> None:
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.back_to_shop = back_to_shop
         self.refresh_target = refresh_target
         self.add_item(_MarginAddSelect(
@@ -1801,7 +1801,7 @@ class MarginSystemView(View):
     返回按鈕會切回 StockSystemView（保留 back_to_shop / refresh_target context）。"""
 
     def __init__(self, *, back_to_shop=None, refresh_target=None) -> None:
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.back_to_shop = back_to_shop
         self.refresh_target = refresh_target
         self._build()

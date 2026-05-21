@@ -253,7 +253,7 @@ class StraightModal(discord.ui.Modal, title='選單號 (0-36)'):
 class RouletteSetupView(discord.ui.View):
     def __init__(self, uid: str, bet: int = DEFAULT_BET,
                  category: str | None = None, detail: int | None = None):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.uid      = uid
         self.bet      = bet
         self.category = category

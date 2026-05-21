@@ -66,6 +66,7 @@ _WALLET_FILE  = os.path.join('data', 'morning_records.json')
 _REPORTS_FILE = os.path.join('data', 'daily_share_reports.json')
 _BANS_FILE    = os.path.join('data', 'daily_share_bans.json')
 _COUNTER_FILE = os.path.join('data', 'daily_share_counter.json')
+_FAVS_FILE    = os.path.join('data', 'manga_favorites.json')
 
 # ── 獎勵設定 ────────────────────────────────────────────────────────────
 _TZ              = timezone(timedelta(hours=8))
@@ -857,12 +858,85 @@ def _parse_sharer_id_from_message(message: discord.Message | None) -> int | None
     return int(m.group(1)) if m else None
 
 
+# ── 收藏：每位用戶私人書籤 ────────────────────────────────────────────
+def _load_favs() -> dict:
+    return load_json(_FAVS_FILE) or {}
+
+
+async def _save_favs(data: dict) -> None:
+    await save_json_async(_FAVS_FILE, data)
+
+
+def get_user_favs(uid: str) -> list[dict]:
+    return list((_load_favs().get('users') or {}).get(uid) or [])
+
+
+async def _add_user_fav(uid: str, entry: dict) -> tuple[bool, str]:
+    """加入收藏；若 url 已在清單中則回 False。新加的擺最前面（最新→最舊）。"""
+    if not entry.get('url'):
+        return False, '此卡片解析不到連結'
+    data = _load_favs()
+    users = data.setdefault('users', {})
+    arr = users.setdefault(uid, [])
+    if any(e.get('url') == entry['url'] for e in arr):
+        return False, '已經在收藏裡了'
+    arr.insert(0, entry)
+    # 上限 200 防止無限長
+    if len(arr) > 200:
+        del arr[200:]
+    await _save_favs(data)
+    return True, ''
+
+
+async def _remove_user_fav(uid: str, url: str) -> bool:
+    data = _load_favs()
+    arr = (data.get('users') or {}).get(uid) or []
+    new_arr = [e for e in arr if e.get('url') != url]
+    if len(new_arr) == len(arr):
+        return False
+    data.setdefault('users', {})[uid] = new_arr
+    await _save_favs(data)
+    return True
+
+
+# 從每日分享 embed 解析出 title / url / thumb（給「加入收藏」用）
+_FAV_PARSE_TITLE_RE = re.compile(r'^漫畫名:\s*(.+)$', re.MULTILINE)
+_FAV_PARSE_URL_RE   = re.compile(r'^連結:\s*(.+)$',   re.MULTILINE)
+
+
+def _parse_share_card(msg: discord.Message) -> dict | None:
+    """從每日分享卡片訊息抓 title / url / thumb，組成可收藏的條目。
+    無法解析時回 None。"""
+    if not msg.embeds:
+        return None
+    embed = msg.embeds[0]
+    desc = embed.description or ''
+    m_t = _FAV_PARSE_TITLE_RE.search(desc)
+    m_u = _FAV_PARSE_URL_RE.search(desc)
+    if not (m_t and m_u):
+        return None
+    thumb = None
+    if embed.image and embed.image.url:
+        thumb = embed.image.url
+    elif embed.thumbnail and embed.thumbnail.url:
+        thumb = embed.thumbnail.url
+    return {
+        'title':     m_t.group(1).strip(),
+        'url':       m_u.group(1).strip(),
+        'thumb':     thumb,
+        'sharer_id': _parse_sharer_id_from_message(msg),
+        'msg_id':    int(msg.id),
+        'added_at':  datetime.now(_TZ).isoformat(timespec='seconds'),
+    }
+
+
 class ReportView(discord.ui.View):
-    """貼在 _TARGET_CHANNEL_ID 每張卡片底下的按鈕列：「🚩 檢舉」+「👍 讚」。
+    """貼在 _TARGET_CHANNEL_ID 每張卡片底下的按鈕列：「🚩 檢舉」+「👍 讚」+ 收藏。
 
     Persistent — label 上的票數 / 讚數是即時 render，每次點按完會 msg.edit
     把整個 view 換成新數字。custom_id 固定（'daily_share:report' /
-    'daily_share:like'），bot 重啟後仍能 route 到註冊過的 dispatcher。
+    'daily_share:like' / 'daily_share:fav_add' / 'daily_share:fav_list'），
+    bot 重啟後仍能 route 到註冊過的 dispatcher。
 
     with_report=False：放行還原時不掛檢舉按鈕，只剩讚。
     """
@@ -887,6 +961,24 @@ class ReportView(discord.ui.View):
         )
         like_btn.callback = self._on_like
         self.add_item(like_btn)
+
+        fav_add_btn = discord.ui.Button(
+            label='加入收藏',
+            emoji='📚',
+            style=discord.ButtonStyle.secondary,
+            custom_id='daily_share:fav_add',
+        )
+        fav_add_btn.callback = self._on_fav_add
+        self.add_item(fav_add_btn)
+
+        fav_list_btn = discord.ui.Button(
+            label='我的收藏',
+            emoji='📖',
+            style=discord.ButtonStyle.secondary,
+            custom_id='daily_share:fav_list',
+        )
+        fav_list_btn.callback = self._on_fav_list
+        self.add_item(fav_list_btn)
 
     async def _on_report(self, interaction: discord.Interaction) -> None:
         msg = interaction.message
@@ -1014,6 +1106,202 @@ class ReportView(discord.ui.View):
         except discord.HTTPException as e:
             print(f'[每日任務] 更新讚數 label 失敗 msg={msg.id}: '
                   f'{type(e).__name__}: {e}')
+
+    async def _on_fav_add(self, interaction: discord.Interaction) -> None:
+        msg = interaction.message
+        if msg is None:
+            await interaction.response.send_message(
+                '找不到對應訊息喵', ephemeral=True,
+            )
+            return
+        entry = _parse_share_card(msg)
+        if entry is None:
+            await interaction.response.send_message(
+                '解析不到這張卡片的資料（可能是舊格式）', ephemeral=True,
+            )
+            return
+        ok, err = await _add_user_fav(str(interaction.user.id), entry)
+        await interaction.response.send_message(
+            f'📚 已加入收藏：**{entry["title"]}**' if ok else f'ℹ️ {err}',
+            ephemeral=True,
+        )
+
+    async def _on_fav_list(self, interaction: discord.Interaction) -> None:
+        uid = str(interaction.user.id)
+        view = FavListView(uid=uid, page=0)
+        embeds = view.build_embeds()
+        await interaction.response.send_message(
+            embeds=embeds, view=view, ephemeral=True,
+        )
+
+
+# ── 收藏清單 view（ephemeral，timeout=None）─────────────────────────────
+class FavListView(discord.ui.View):
+    """ephemeral 列表，每頁 5 個獨立小 embed（含 thumbnail），prev/next + 頁碼 select。"""
+
+    _PAGE_SIZE = 5
+
+    def __init__(self, *, uid: str, page: int):
+        super().__init__(timeout=None)
+        self.uid = uid
+        self.page = page
+        self._favs = get_user_favs(uid)
+        self.total_pages = max(
+            1, (len(self._favs) + self._PAGE_SIZE - 1) // self._PAGE_SIZE
+        )
+        if self.page >= self.total_pages:
+            self.page = max(0, self.total_pages - 1)
+        self._build()
+
+    def build_embeds(self) -> list[discord.Embed]:
+        if not self._favs:
+            return [discord.Embed(
+                title='📖 我的收藏',
+                description='_(還沒有收藏任何漫畫)_',
+                color=discord.Color.greyple(),
+            )]
+        start = self.page * self._PAGE_SIZE
+        slice_ = self._favs[start:start + self._PAGE_SIZE]
+        embeds: list[discord.Embed] = []
+        # header embed：總數 + 頁碼資訊
+        embeds.append(discord.Embed(
+            title=f'📖 我的收藏 ({len(self._favs)} 筆)',
+            description=f'第 {self.page + 1}/{self.total_pages} 頁',
+            color=discord.Color.gold(),
+        ))
+        for i, fav in enumerate(slice_):
+            embed = discord.Embed(
+                title=fav.get('title', '(無標題)'),
+                url=fav.get('url'),
+                color=discord.Color.magenta(),
+            )
+            thumb = fav.get('thumb')
+            if thumb:
+                embed.set_thumbnail(url=thumb)
+            embed.set_footer(text=f'#{start + i + 1}　加入時間 {fav.get("added_at", "")[:16]}')
+            embeds.append(embed)
+        return embeds
+
+    def _build(self) -> None:
+        self.clear_items()
+
+        # Row 0: 頁碼 select（總頁 >1 才顯示）
+        if self.total_pages > 1:
+            if self.total_pages <= 25:
+                page_values = list(range(self.total_pages))
+            else:
+                step = self.total_pages / 25
+                page_values = sorted({int(i * step) for i in range(25)})[:25]
+                if self.page not in page_values:
+                    page_values = sorted(set(page_values) | {self.page})[-25:]
+            page_options = [
+                discord.SelectOption(
+                    label=f'第 {p + 1} 頁',
+                    value=str(p),
+                    default=(p == self.page),
+                )
+                for p in page_values
+            ]
+            page_sel = discord.ui.Select(
+                placeholder=f'跳到頁數… (共 {self.total_pages} 頁)',
+                options=page_options, min_values=1, max_values=1, row=0,
+            )
+            page_sel.callback = self._jump_page
+            self.add_item(page_sel)
+
+        # Row 1: 移除某筆（select）
+        start = self.page * self._PAGE_SIZE
+        slice_ = self._favs[start:start + self._PAGE_SIZE]
+        if slice_:
+            rm_options: list[discord.SelectOption] = []
+            for i, fav in enumerate(slice_):
+                title = fav.get('title', '(無標題)')
+                rm_options.append(discord.SelectOption(
+                    label=f'#{start + i + 1} {title}'[:100],
+                    value=fav.get('url') or '',
+                    description='移除此收藏',
+                ))
+            rm_sel = discord.ui.Select(
+                placeholder='移除收藏…（選一筆）',
+                options=rm_options, min_values=1, max_values=1, row=1,
+            )
+            rm_sel.callback = self._on_remove
+            self.add_item(rm_sel)
+
+        # Row 2: 上 / 下 / 關閉
+        prev_btn = discord.ui.Button(
+            label='◀️ 上一頁', style=discord.ButtonStyle.secondary,
+            disabled=(self.page <= 0), row=2,
+        )
+        prev_btn.callback = self._prev
+        self.add_item(prev_btn)
+        next_btn = discord.ui.Button(
+            label='下一頁 ▶️', style=discord.ButtonStyle.secondary,
+            disabled=(self.page >= self.total_pages - 1), row=2,
+        )
+        next_btn.callback = self._next
+        self.add_item(next_btn)
+        close_btn = discord.ui.Button(
+            label='✖️ 關閉', style=discord.ButtonStyle.danger, row=2,
+        )
+        close_btn.callback = self._close
+        self.add_item(close_btn)
+
+    async def _check(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) != self.uid:
+            await interaction.response.send_message(
+                '這不是你的收藏視窗', ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction) -> None:
+        new = FavListView(uid=self.uid, page=self.page)
+        await interaction.response.edit_message(
+            embeds=new.build_embeds(), view=new,
+        )
+
+    async def _jump_page(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        try:
+            p = int(interaction.data['values'][0])
+        except (ValueError, KeyError, IndexError):
+            await interaction.response.defer()
+            return
+        self.page = max(0, min(self.total_pages - 1, p))
+        await self._refresh(interaction)
+
+    async def _prev(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        self.page = max(0, self.page - 1)
+        await self._refresh(interaction)
+
+    async def _next(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        self.page = min(self.total_pages - 1, self.page + 1)
+        await self._refresh(interaction)
+
+    async def _on_remove(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        url = interaction.data['values'][0]
+        if not url:
+            await interaction.response.defer()
+            return
+        await _remove_user_fav(self.uid, url)
+        await self._refresh(interaction)
+
+    async def _close(self, interaction: discord.Interaction) -> None:
+        if not await self._check(interaction):
+            return
+        try:
+            await interaction.response.defer()
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
 
 
 class AdminReportView(discord.ui.View):
@@ -1246,7 +1534,7 @@ class AdminReportView(discord.ui.View):
 # ─────────────────────────────────────────────────────────────────────────
 class DailyTaskHomeView(discord.ui.View):
     def __init__(self, uid: str, *, opener: discord.Interaction):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.uid    = uid
         self.opener = opener
 
@@ -1532,7 +1820,7 @@ class AdminPanelHomeView(discord.ui.View):
     """主選單：解禁 / 暫時封禁 / 永久封禁。後二者都是進子面板選輸入方式。"""
 
     def __init__(self, *, opener: discord.Interaction):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.opener = opener
 
     @discord.ui.button(label='解禁用戶', emoji='🔓',
@@ -1580,7 +1868,7 @@ class AdminBanMethodView(discord.ui.View):
     """子面板：選擇封禁輸入方式（依用戶 ID / 依流水號）。perm 旗標決定要不要問天數。"""
 
     def __init__(self, *, opener: discord.Interaction, perm: bool):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.opener = opener
         self.perm   = perm
 
@@ -1615,7 +1903,7 @@ class AdminUnbanView(discord.ui.View):
 
     def __init__(self, guild: discord.Guild | None,
                  *, opener: discord.Interaction):
-        super().__init__(timeout=300)
+        super().__init__(timeout=86400)
         self.guild  = guild
         self.opener = opener
 
